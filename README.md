@@ -43,6 +43,7 @@ Customize versions at build time:
 |----------|---------|-------------|
 | `NODE_VERSION` | `22` | Node.js version (installed via nvm) |
 | `PYTHON_VERSION` | `3.12` | Python version (installed via uv) |
+| `INCLUDE_FIREWALL` | `true` | Include firewall capability (`false` to exclude entirely) |
 
 Example with custom versions:
 
@@ -51,6 +52,15 @@ container build \
     --tag yolo-sandbox \
     --build-arg NODE_VERSION=20 \
     --build-arg PYTHON_VERSION=3.11 \
+    .
+```
+
+Example without firewall capability:
+
+```bash
+container build \
+    --tag yolo-sandbox \
+    --build-arg INCLUDE_FIREWALL=false \
     .
 ```
 
@@ -123,6 +133,45 @@ curl -I https://api.anthropic.com  # Should work
 curl -I https://google.com          # Should fail (if firewall enabled)
 ```
 
+## Shell Helpers
+
+Add to your `.zshrc` or `.bashrc`:
+
+```bash
+source ~/Documents/Code_projects/yolo-sandbox/yolo.sh
+```
+
+Available commands:
+
+| Command | Description |
+|---------|-------------|
+| `yolo [dir]` | Start Claude Code or enter if already running |
+| `yolo-run [dir]` | Run Claude Code with project directory |
+| `yolo-shell` | Enter running container with bash |
+| `yolo-build [--no-firewall] [node] [python]` | Build image with custom versions |
+| `yolo-stop` | Stop container |
+| `yolo-rm` | Remove container |
+| `yolo-status` | Show container status |
+
+Examples:
+
+```bash
+# Build with defaults (Node 22, Python 3.12, firewall enabled)
+yolo-build
+
+# Build without firewall, Node 20, Python 3.11
+yolo-build --no-firewall 20 3.11
+
+# Run Claude Code in current directory
+yolo
+
+# Run Claude Code in specific project
+yolo ~/projects/my-app
+
+# Disable firewall at runtime
+YOLO_FIREWALL=false yolo ~/projects/my-app
+```
+
 ## Files
 
 | File | Description |
@@ -130,6 +179,7 @@ curl -I https://google.com          # Should fail (if firewall enabled)
 | `Containerfile` | Container image definition |
 | `setup-firewall.sh` | iptables rules for network restrictions |
 | `entrypoint.sh` | Startup script (firewall setup + claude launch) |
+| `yolo.sh` | Shell helper functions |
 
 ## Customization
 

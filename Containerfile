@@ -3,10 +3,12 @@ FROM docker.io/ubuntu:24.04
 # Version arguments (can be overridden at build time)
 ARG NODE_VERSION=22
 ARG PYTHON_VERSION=3.12
+ARG INCLUDE_FIREWALL=true
 
 # Set environment variables
 ENV NODE_VERSION=${NODE_VERSION}
 ENV PYTHON_VERSION=${PYTHON_VERSION}
+ENV INCLUDE_FIREWALL=${INCLUDE_FIREWALL}
 ENV NVM_DIR=/usr/local/nvm
 ENV PATH="${NVM_DIR}/versions/node/v${NODE_VERSION}/bin:$PATH"
 

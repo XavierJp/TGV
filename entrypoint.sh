@@ -1,11 +1,15 @@
 #!/bin/bash
 set -e
 
-# Setup firewall only if enabled (default: true)
-if [ "${ENABLE_FIREWALL:-true}" = "true" ]; then
+# Firewall control:
+#   INCLUDE_FIREWALL (build-time): if "false", firewall is not available
+#   ENABLE_FIREWALL (runtime): if "false", skip firewall even if included
+if [ "${INCLUDE_FIREWALL:-true}" = "false" ]; then
+    echo "Firewall not included in this build (INCLUDE_FIREWALL=false)"
+elif [ "${ENABLE_FIREWALL:-true}" = "true" ]; then
     /usr/local/bin/setup-firewall.sh
 else
-    echo "Firewall disabled (ENABLE_FIREWALL=false)"
+    echo "Firewall disabled at runtime (ENABLE_FIREWALL=false)"
 fi
 
 # Drop to agent user and run claude with proper environment
