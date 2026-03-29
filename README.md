@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="logo.png" alt="tgv" width="400" style="border-radius: 16px;" />
+  <img src="logo.png" alt="tgv" width="400" />
 </p>
 
 # tgv — Terminal à Grande Vitesse
