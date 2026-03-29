@@ -5,7 +5,9 @@ use std::path::PathBuf;
 
 /// Where tgv stores its config and secrets
 fn config_dir() -> PathBuf {
-    dirs::home_dir().unwrap().join(".tgv")
+    dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("/tmp"))
+        .join(".tgv")
 }
 
 pub fn config_file() -> PathBuf {
@@ -58,6 +60,15 @@ pub struct RepoConfig {
     pub default_branch: String,
 }
 
+/// Git user identity for commits inside containers
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct GitConfig {
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub email: String,
+}
+
 fn default_branch() -> String {
     "main".to_string()
 }
@@ -68,6 +79,8 @@ pub struct Config {
     pub server: ServerConfig,
     pub docker: DockerConfig,
     pub repo: RepoConfig,
+    #[serde(default)]
+    pub git: GitConfig,
 }
 
 impl Config {
@@ -92,7 +105,13 @@ impl Config {
         let dir = config_dir();
         std::fs::create_dir_all(&dir)?;
         let contents = toml::to_string_pretty(self)?;
-        std::fs::write(config_file(), contents)?;
+        let path = config_file();
+        std::fs::write(&path, contents)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+        }
         Ok(())
     }
 }

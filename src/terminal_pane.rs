@@ -4,6 +4,7 @@
 use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 use std::io::Read;
 use std::sync::{Arc, Mutex};
+use std::thread::JoinHandle;
 use vt100::Parser;
 
 /// An embedded terminal session backed by a real PTY
@@ -14,17 +15,21 @@ pub struct EmbeddedTerminal {
     writer: Box<dyn std::io::Write + Send>,
     /// Child process handle — killed on drop
     child: Box<dyn portable_pty::Child + Send>,
-    /// PTY master — held to control lifetime; dropped to close reader thread
-    _master: Box<dyn portable_pty::MasterPty + Send>,
+    /// PTY master — dropped before reader thread to unblock it
+    master: Option<Box<dyn portable_pty::MasterPty + Send>>,
+    /// Reader thread handle — joined on drop
+    reader_thread: Option<JoinHandle<()>>,
 }
 
 impl EmbeddedTerminal {
-    /// Start a new embedded terminal running the given command.
-    /// `cols` and `rows` are the initial terminal size.
-    pub fn new(command: &str, args: &[&str], cols: u16, rows: u16) -> Result<Self, Box<dyn std::error::Error>> {
+    pub fn new(
+        command: &str,
+        args: &[&str],
+        cols: u16,
+        rows: u16,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
         let pty_system = native_pty_system();
 
-        // Create PTY with the given size
         let pair = pty_system.openpty(PtySize {
             rows,
             cols,
@@ -32,29 +37,24 @@ impl EmbeddedTerminal {
             pixel_height: 0,
         })?;
 
-        // Build the command to run inside the PTY
         let mut cmd = CommandBuilder::new(command);
         cmd.args(args);
 
-        // Spawn the process
         let child = pair.slave.spawn_command(cmd)?;
+        // Close parent's copy of slave fd so EOF propagates correctly
+        drop(pair.slave);
 
-        // Get a reader for the PTY output
         let mut reader = pair.master.try_clone_reader()?;
-
-        // Get a writer to send input to the PTY
         let writer = pair.master.take_writer()?;
 
-        // Create the vt100 parser that will interpret the terminal output
         let parser = Arc::new(Mutex::new(Parser::new(rows, cols, 1000)));
 
-        // Spawn a thread that reads PTY output and feeds it to the parser
         let parser_clone = Arc::clone(&parser);
-        std::thread::spawn(move || {
-            let mut buf = [0u8; 4096];
+        let reader_thread = std::thread::spawn(move || {
+            let mut buf = [0u8; 65536];
             loop {
                 match reader.read(&mut buf) {
-                    Ok(0) => break,  // PTY closed
+                    Ok(0) => break,
                     Ok(n) => {
                         if let Ok(mut p) = parser_clone.lock() {
                             p.process(&buf[..n]);
@@ -69,7 +69,8 @@ impl EmbeddedTerminal {
             parser,
             writer,
             child,
-            _master: pair.master,
+            master: Some(pair.master),
+            reader_thread: Some(reader_thread),
         })
     }
 
@@ -81,20 +82,31 @@ impl EmbeddedTerminal {
         Ok(())
     }
 
-    /// Resize the PTY
-    pub fn resize(&self, cols: u16, rows: u16) -> Result<(), Box<dyn std::error::Error>> {
-        // Note: portable-pty doesn't expose resize on the writer directly.
-        // For now we update the parser size; full resize needs master handle.
+    /// Resize the PTY (call when pane dimensions change)
+    pub fn resize(&self, cols: u16, rows: u16) {
+        if let Some(ref master) = self.master {
+            let _ = master.resize(PtySize {
+                rows,
+                cols,
+                pixel_width: 0,
+                pixel_height: 0,
+            });
+        }
         if let Ok(mut p) = self.parser.lock() {
             p.set_size(rows, cols);
         }
-        Ok(())
     }
 }
 
 impl Drop for EmbeddedTerminal {
     fn drop(&mut self) {
         let _ = self.child.kill();
+        // Drop master first to close PTY fd and unblock reader thread
+        self.master.take();
         let _ = self.child.wait();
+        // Join reader thread
+        if let Some(handle) = self.reader_thread.take() {
+            let _ = handle.join();
+        }
     }
 }

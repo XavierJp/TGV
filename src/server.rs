@@ -16,9 +16,21 @@ pub struct CmdResult {
 
 /// Path to the ControlMaster socket for a given target
 fn control_path(config: &Config) -> PathBuf {
-    let dir = std::env::temp_dir().join("tgv-ssh");
-    std::fs::create_dir_all(&dir).ok();
-    dir.join(format!("{}", config.ssh_target()))
+    // macOS limits Unix socket paths to 104 chars — keep it short
+    let dir = PathBuf::from("/tmp/tgv-s");
+    if let Ok(()) = std::fs::create_dir_all(&dir) {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
+        }
+    }
+    // Use a short hash of the target instead of the full user@host string
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+    let mut h = DefaultHasher::new();
+    config.ssh_target().hash(&mut h);
+    dir.join(format!("{:x}", h.finish()))
 }
 
 /// Common SSH args including multiplexing options
@@ -30,6 +42,8 @@ fn ssh_mux_args(config: &Config) -> Vec<String> {
         "-o".into(), format!("ControlPath={}", cp.display()),
         "-o".into(), "ControlMaster=auto".into(),
         "-o".into(), "ControlPersist=600".into(),
+        "-o".into(), "ServerAliveInterval=5".into(),
+        "-o".into(), "ServerAliveCountMax=3".into(),
     ]
 }
 
@@ -72,6 +86,57 @@ pub fn scp_to(
         success: output.status.success(),
         stdout: String::from_utf8_lossy(&output.stdout).trim().to_string(),
         stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
+    })
+}
+
+/// Write a string to a remote file via stdin (never on command line)
+pub fn scp_string_to(
+    config: &Config,
+    content: &str,
+    remote_path: &str,
+    mode: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use std::io::Write;
+    let mut args = ssh_mux_args(config);
+    args.push(config.ssh_target());
+    args.push(format!("cat > {remote_path} && chmod {mode} {remote_path}"));
+
+    let mut child = Command::new("ssh")
+        .args(&args)
+        .stdin(std::process::Stdio::piped())
+        .spawn()?;
+
+    if let Some(ref mut stdin) = child.stdin {
+        stdin.write_all(content.as_bytes())?;
+    }
+    drop(child.stdin.take());
+
+    let status = child.wait()?;
+    if !status.success() {
+        return Err(format!("Failed to write to {remote_path}").into());
+    }
+    Ok(())
+}
+
+/// Fast SSH ping with a short 3s timeout (reuses ControlMaster if available)
+pub fn ssh_ping(config: &Config) -> Result<CmdResult, Box<dyn std::error::Error>> {
+    let cp = control_path(config);
+    let output = Command::new("ssh")
+        .args([
+            "-o", "ConnectTimeout=3",
+            "-o", "StrictHostKeyChecking=accept-new",
+            "-o", &format!("ControlPath={}", cp.display()),
+            "-o", "ControlMaster=auto",
+            "-o", "ControlPersist=600",
+            &config.ssh_target(),
+            "true",
+        ])
+        .output()?;
+
+    Ok(CmdResult {
+        success: output.status.success(),
+        stdout: String::new(),
+        stderr: String::new(),
     })
 }
 
