@@ -1,18 +1,78 @@
 //! tgv — Terminal à Grande Vitesse
 //!
-//! Remote Claude Code session manager with embedded terminal.
-//! Two commands: `tgv init` (server setup) and `tgv` (TUI).
+//! Remote Claude Code session manager.
+//! `tgv init` bootstraps a server, `tgv` lists/attaches/creates sessions.
 
-mod app;
 mod banner;
 mod config;
 mod server;
 mod session;
-mod terminal_pane;
-mod ui;
 
 use clap::{Parser, Subcommand};
 use config::Config;
+use console::{style, Style};
+use dialoguer::{theme::ColorfulTheme, FuzzySelect};
+use session::Session;
+use std::io::Write;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+
+const BRAILLE_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+
+/// A spinner that can update its message while running.
+struct Spinner {
+    msg: Arc<std::sync::Mutex<String>>,
+    done: Arc<AtomicBool>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Spinner {
+    fn new(initial_msg: &str) -> Self {
+        let msg = Arc::new(std::sync::Mutex::new(initial_msg.to_string()));
+        let done = Arc::new(AtomicBool::new(false));
+        let msg2 = msg.clone();
+        let done2 = done.clone();
+
+        let handle = std::thread::spawn(move || {
+            let mut i = 0;
+            while !done2.load(Ordering::Relaxed) {
+                let frame = BRAILLE_FRAMES[i % BRAILLE_FRAMES.len()];
+                let text = msg2.lock().unwrap().clone();
+                eprint!("\r\x1b[2K{} {}", style(frame).cyan(), style(&text).dim());
+                let _ = std::io::stderr().flush();
+                std::thread::sleep(std::time::Duration::from_millis(80));
+                i += 1;
+            }
+            eprint!("\r\x1b[2K");
+            let _ = std::io::stderr().flush();
+        });
+
+        Self {
+            msg,
+            done,
+            handle: Some(handle),
+        }
+    }
+
+    fn set_message(&self, msg: &str) {
+        *self.msg.lock().unwrap() = msg.to_string();
+    }
+}
+
+impl Drop for Spinner {
+    fn drop(&mut self) {
+        self.done.store(true, Ordering::Relaxed);
+        if let Some(h) = self.handle.take() {
+            let _ = h.join();
+        }
+    }
+}
+
+/// Run a closure while showing a braille spinner with a message.
+fn with_spinner<T, F: FnOnce() -> T>(msg: &str, f: F) -> T {
+    let _spinner = Spinner::new(msg);
+    f()
+}
 
 /// Terminal à Grande Vitesse — remote Claude Code session manager
 #[derive(Parser)]
@@ -42,9 +102,6 @@ enum Commands {
         #[arg(long, default_value_t = false)]
         private: bool,
 
-        /// Eternal Terminal port
-        #[arg(long, default_value_t = 2022)]
-        et_port: u16,
     },
 }
 
@@ -57,33 +114,199 @@ fn main() {
             repo,
             branch,
             private,
-            et_port,
         }) => {
-            banner::print_banner();
-            if let Err(e) = init_server(&host, &repo, &branch, private, et_port) {
-                eprintln!("Error: {e}");
+            if let Err(e) = init_server(&host, &repo, &branch, private) {
+                eprintln!("{} {e}", style("Error:").red().bold());
                 std::process::exit(1);
             }
         }
         None => {
-            let config = match Config::load() {
-                Ok(c) => c,
-                Err(e) => {
-                    eprintln!("Failed to load config: {e}");
-                    eprintln!("Run `tgv init --host user@ip --repo <url>` first.");
-                    std::process::exit(1);
-                }
-            };
-            if config.server.host.is_empty() {
-                eprintln!("No server configured. Run: tgv init --host user@ip --repo <url>");
-                std::process::exit(1);
-            }
-            if let Err(e) = app::run(config) {
-                eprintln!("Error: {e}");
+            let config = load_config();
+            if let Err(e) = interactive(&config) {
+                eprintln!("{} {e}", style("Error:").red().bold());
                 std::process::exit(1);
             }
         }
     }
+}
+
+fn load_config() -> Config {
+    let config = match Config::load() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("{} {e}", style("Error:").red().bold());
+            eprintln!("Run `tgv init --host user@ip --repo <url>` first.");
+            std::process::exit(1);
+        }
+    };
+    if config.server.host.is_empty() {
+        eprintln!("No server configured. Run: tgv init --host user@ip --repo <url>");
+        std::process::exit(1);
+    }
+    config
+}
+
+fn connect(config: &Config) -> Result<(), Box<dyn std::error::Error>> {
+    let check = with_spinner("Connecting", || server::ssh_run(config, "true"))?;
+    if !check.success {
+        let mut msg = format!("Cannot reach {}", config.ssh_target());
+        if !check.stderr.is_empty() {
+            msg.push_str(&format!("\n{}", check.stderr));
+        }
+        return Err(msg.into());
+    }
+    Ok(())
+}
+
+fn fetch_sessions(config: &Config) -> Result<Vec<Session>, Box<dyn std::error::Error>> {
+    let sessions = with_spinner("Fetching sessions", || session::list_sessions(config))?;
+    Ok(with_spinner("Loading git stats", || {
+        sessions
+            .into_iter()
+            .map(|mut s| {
+                if s.status == "running" {
+                    if let Ok(m) = session::git_metrics(config, &s.name) {
+                        s.insertions = m.insertions;
+                        s.deletions = m.deletions;
+                    }
+                }
+                s
+            })
+            .collect()
+    }))
+}
+
+fn tgv_theme() -> ColorfulTheme {
+    ColorfulTheme {
+        active_item_style: Style::new().yellow().bold(),
+        active_item_prefix: style("  ▸ ".to_string()).yellow().bold(),
+        inactive_item_prefix: style("    ".to_string()),
+        prompt_style: Style::new().magenta().bold(),
+        prompt_prefix: style("  ".to_string()),
+        success_prefix: style("  ▸ ".to_string()).yellow().bold(),
+        ..ColorfulTheme::default()
+    }
+}
+
+fn format_session(s: &Session) -> String {
+    let icon = if s.status == "running" { "●" } else { "○" };
+    let mut parts = vec![s.repo.clone()];
+    if let Some(ins) = s.insertions {
+        parts.push(format!("+{ins}"));
+    }
+    if let Some(del) = s.deletions {
+        parts.push(format!("-{del}"));
+    }
+    format!("{icon}  {}  ╌  {}", s.branch, parts.join(" · "))
+}
+
+fn print_header(config: &Config) {
+    eprint!("\x1b[2J\x1b[H"); // clear screen + cursor home
+    banner::print_banner();
+    eprintln!("  {}", style(config.ssh_target()).dim());
+    eprintln!();
+}
+
+/// Interactive session picker
+fn interactive(config: &Config) -> Result<(), Box<dyn std::error::Error>> {
+    print_header(config);
+    connect(config)?;
+
+    let theme = tgv_theme();
+
+    loop {
+        print_header(config);
+
+        let sessions = fetch_sessions(config)?;
+        let mut items: Vec<String> = sessions.iter().map(format_session).collect();
+        items.push("＋ New session".to_string());
+
+        let selection = FuzzySelect::with_theme(&theme)
+            .with_prompt("Session")
+            .items(&items)
+            .default(0)
+            .interact_opt()?;
+
+        let Some(selection) = selection else {
+            return Ok(());
+        };
+
+        if selection == sessions.len() {
+            let branch: String = dialoguer::Input::with_theme(&theme)
+                .with_prompt("Branch (empty for random)")
+                .allow_empty(true)
+                .interact_text()?;
+
+            let branch = if branch.trim().is_empty() {
+                session::random_branch_name()
+            } else {
+                branch.trim().to_string()
+            };
+
+            let name = {
+                let spinner = Spinner::new(&format!("Spawning on {branch}"));
+                session::spawn(config, &branch, |step| {
+                    spinner.set_message(&format!("Spawning on {branch} · {step}"));
+                })?
+            };
+            eprintln!("  {} {name}", style("Created").green());
+            attach(config, &name)?;
+            return Ok(());
+        }
+
+        // Action picker
+        print_header(config);
+        let s = &sessions[selection];
+        let action_label = if s.status == "running" { "▶ Attach" } else { "▶ Restart & attach" };
+        let actions = &[action_label, "✕ Kill", "‹ Back"];
+
+        let action = FuzzySelect::with_theme(&theme)
+            .with_prompt(&s.branch)
+            .items(actions)
+            .default(0)
+            .interact_opt()?;
+
+        match action {
+            Some(0) => {
+                if s.status != "running" {
+                    with_spinner(&format!("Restarting {}", s.name), || {
+                        let _ = server::ssh_run(config, &format!("docker start {}", s.name));
+                        std::thread::sleep(std::time::Duration::from_secs(1));
+                    });
+                }
+                attach(config, &s.name)?;
+                return Ok(());
+            }
+            Some(1) => {
+                let name = s.name.clone();
+                let branch = s.branch.clone();
+                with_spinner(&format!("Killing {name}"), || {
+                    let _ = session::stop(config, &name);
+                });
+                eprintln!("  {} {branch}", style("Killed").red());
+                continue;
+            }
+            _ => continue,
+        }
+    }
+}
+
+/// Attach to a session — takes over the terminal via SSH
+fn attach(config: &Config, container: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let docker_cmd = session::attach_cmd(container);
+    let ssh_target = config.ssh_target();
+    println!(
+        "{}",
+        style(format!("Attaching to {container}...")).dim()
+    );
+    let status = std::process::Command::new("ssh")
+        .args(["-t", &ssh_target, &docker_cmd])
+        .status()?;
+
+    if !status.success() {
+        return Err("Connection closed".into());
+    }
+    Ok(())
 }
 
 /// Run `tgv init` to bootstrap a remote server.
@@ -92,7 +315,6 @@ fn init_server(
     repo: &str,
     branch: &str,
     private: bool,
-    et_port: u16,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (user, hostname) = if let Some(pos) = host.find('@') {
         (&host[..pos], &host[pos + 1..])
@@ -103,7 +325,6 @@ fn init_server(
     let mut config = Config::default();
     config.server.host = hostname.to_string();
     config.server.user = user.to_string();
-    config.server.et_port = et_port;
     config.repo.url = repo.to_string();
     config.repo.default_branch = branch.to_string();
 
@@ -111,15 +332,29 @@ fn init_server(
     if !repo.starts_with("https://") && !repo.starts_with("git@") {
         return Err("Repo URL must start with https:// or git@".into());
     }
+    if repo.chars().any(|c| {
+        matches!(
+            c,
+            ';' | '|' | '&' | '`' | '$' | '(' | ')' | '{' | '}' | '<' | '>' | '\n' | '\0'
+        )
+    }) {
+        return Err("Repo URL contains invalid characters".into());
+    }
     session::validate_branch(branch).map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
 
     // Auto-detect git identity from local machine
-    if let Ok(out) = std::process::Command::new("git").args(["config", "user.name"]).output() {
+    if let Ok(out) = std::process::Command::new("git")
+        .args(["config", "user.name"])
+        .output()
+    {
         if out.status.success() {
             config.git.name = String::from_utf8_lossy(&out.stdout).trim().to_string();
         }
     }
-    if let Ok(out) = std::process::Command::new("git").args(["config", "user.email"]).output() {
+    if let Ok(out) = std::process::Command::new("git")
+        .args(["config", "user.email"])
+        .output()
+    {
         if out.status.success() {
             config.git.email = String::from_utf8_lossy(&out.stdout).trim().to_string();
         }
@@ -129,10 +364,9 @@ fn init_server(
     println!("Checking local dependencies...");
     for (bin, name, hint) in [
         ("ssh", "OpenSSH", "brew install openssh"),
-        ("et", "Eternal Terminal", "brew install MisterTea/et/et"),
         ("scp", "scp", "brew install openssh"),
     ] {
-        if which::which(bin).is_err() {
+        if std::process::Command::new("which").arg(bin).output().map(|o| !o.status.success()).unwrap_or(true) {
             eprintln!("  ✗ {name} — install with: {hint}");
             return Err(format!("Missing: {name}").into());
         }
@@ -150,14 +384,19 @@ fn init_server(
     // Remote deps
     println!("Checking remote dependencies...");
     for (cmd, name, hint) in [
-        ("docker --version", "Docker", "curl -fsSL https://get.docker.com | sh"),
-        ("tmux -V", "tmux", "sudo apt install -y tmux"),
-        ("et --version", "ET", "sudo add-apt-repository ppa:jgmath2000/et && sudo apt install -y et"),
+        (
+            "docker --version",
+            "Docker",
+            "curl -fsSL https://get.docker.com | sh",
+        ),
         ("git --version", "git", "sudo apt install -y git"),
     ] {
         let r = server::ssh_run(&config, cmd)?;
         if r.success {
-            println!("  ✓ {name}: {}", r.stdout.lines().next().unwrap_or(""));
+            println!(
+                "  ✓ {name}: {}",
+                r.stdout.lines().next().unwrap_or("")
+            );
         } else {
             eprintln!("  ✗ {name} — install: {hint}");
             return Err(format!("Missing on server: {name}").into());
@@ -168,25 +407,34 @@ fn init_server(
     let claude_bin = "PATH=$PATH:$HOME/.claude/local/bin:$HOME/.local/bin:/usr/local/bin";
 
     // Install Claude Code on server if missing
-    let claude_check = server::ssh_run(&config, &format!("{claude_bin} claude --version 2>/dev/null"))?;
+    let claude_check = server::ssh_run(
+        &config,
+        &format!("{claude_bin} claude --version 2>/dev/null"),
+    )?;
     if claude_check.success {
-        println!("  ✓ Claude Code: {}", claude_check.stdout.lines().next().unwrap_or(""));
+        println!(
+            "  ✓ Claude Code: {}",
+            claude_check.stdout.lines().next().unwrap_or("")
+        );
     } else {
         println!("  Installing Claude Code on server...");
-        let install = server::ssh_run(&config, "bash -c 'curl -fsSL https://claude.ai/install.sh | bash'")?;
+        let install = server::ssh_run(
+            &config,
+            "bash -c 'curl -fsSL https://claude.ai/install.sh | bash'",
+        )?;
         if !install.success {
             return Err(format!("Failed to install Claude Code: {}", install.stderr).into());
         }
-        // Add to PATH in bashrc
-        server::ssh_run(&config,
-            "grep -q '.claude/local/bin' ~/.bashrc 2>/dev/null || echo 'export PATH=$PATH:$HOME/.claude/local/bin' >> ~/.bashrc"
+        server::ssh_run(
+            &config,
+            "grep -q '.claude/local/bin' ~/.bashrc 2>/dev/null || echo 'export PATH=$PATH:$HOME/.claude/local/bin' >> ~/.bashrc",
         )?;
         println!("  ✓ Claude Code installed");
     }
 
     // Setup Claude Code auth on the server
     println!("Setting up Claude Code auth on server...");
-    let check = server::ssh_run(&config, &format!("{claude_bin} && echo $CLAUDE_CODE_OAUTH_TOKEN"))?;
+    let check = server::ssh_run(&config, "cat ~/.config/tgv/oauth_token 2>/dev/null")?;
     if check.stdout.trim().is_empty() {
         println!("  No token found on server. Running claude setup-token remotely...");
         println!("  ⚠ This will print a URL — open it in your browser to authenticate.");
@@ -201,13 +449,12 @@ fn init_server(
         if !status.success() {
             eprintln!("  ⚠ claude setup-token failed — sessions will require manual login");
         } else {
-            // Save token to a dedicated secrets file (not bashrc)
             server::ssh_run(&config, &format!(
                 "{claude_bin} && mkdir -p ~/.config/tgv && echo \"$CLAUDE_CODE_OAUTH_TOKEN\" > ~/.config/tgv/oauth_token && chmod 600 ~/.config/tgv/oauth_token"
             ))?;
-            // Source from secrets file in bashrc (only the file read, not the token itself)
-            server::ssh_run(&config,
-                "grep -q 'tgv/oauth_token' ~/.bashrc 2>/dev/null || echo 'export CLAUDE_CODE_OAUTH_TOKEN=$(cat ~/.config/tgv/oauth_token 2>/dev/null)' >> ~/.bashrc"
+            server::ssh_run(
+                &config,
+                "grep -q 'tgv/oauth_token' ~/.bashrc 2>/dev/null || echo 'export CLAUDE_CODE_OAUTH_TOKEN=$(cat ~/.config/tgv/oauth_token 2>/dev/null)' >> ~/.bashrc",
             )?;
             println!("  Token configured on server");
         }
@@ -219,27 +466,41 @@ fn init_server(
     println!("Building Docker image with {repo} ({branch})...");
     let docker_dir = std::env::current_dir()?.join("docker");
     server::ssh_run(&config, "mkdir -p /tmp/tgv-build")?;
-    server::scp_to(&config, &docker_dir.join("Dockerfile").to_string_lossy(), "/tmp/tgv-build/Dockerfile")?;
+    server::scp_to(
+        &config,
+        &docker_dir.join("Dockerfile").to_string_lossy(),
+        "/tmp/tgv-build/Dockerfile",
+    )?;
 
     // Clone repo on server host (not in Docker — no token leak)
     if private {
-        let gh_out = std::process::Command::new("gh").args(["auth", "token"]).output()?;
+        let gh_out = std::process::Command::new("gh")
+            .args(["auth", "token"])
+            .output()?;
         if !gh_out.status.success() {
             return Err("--private requires `gh auth login` first".into());
         }
         let token = String::from_utf8_lossy(&gh_out.stdout).trim().to_string();
         println!("  GitHub token found");
-        // Write token to file (not command line), askpass script reads it
         server::ssh_run(&config, "printf '#!/bin/sh\ncat /tmp/tgv-build/.git-token' > /tmp/tgv-build/.git-askpass && chmod 700 /tmp/tgv-build/.git-askpass")?;
         server::scp_string_to(&config, &token, "/tmp/tgv-build/.git-token", "600")?;
-        server::ssh_run(&config, &format!(
-            "GIT_ASKPASS=/tmp/tgv-build/.git-askpass git clone --branch {branch} https://x-access-token@github.com/{} /tmp/tgv-build/repo",
-            repo.trim_start_matches("https://github.com/")
-        ))?;
+        server::ssh_run(
+            &config,
+            &format!(
+                "GIT_ASKPASS=/tmp/tgv-build/.git-askpass git clone --branch {branch} https://x-access-token@github.com/{} /tmp/tgv-build/repo",
+                repo.trim_start_matches("https://github.com/")
+            ),
+        )?;
         server::ssh_run(&config, "rm -f /tmp/tgv-build/.git-askpass /tmp/tgv-build/.git-token")?;
-        server::ssh_run(&config, &format!("cd /tmp/tgv-build/repo && git remote set-url origin {repo}"))?;
+        server::ssh_run(
+            &config,
+            &format!("cd /tmp/tgv-build/repo && git remote set-url origin {repo}"),
+        )?;
     } else {
-        let r = server::ssh_run(&config, &format!("git clone --branch {branch} {repo} /tmp/tgv-build/repo"))?;
+        let r = server::ssh_run(
+            &config,
+            &format!("git clone --branch {branch} {repo} /tmp/tgv-build/repo"),
+        )?;
         if !r.success {
             return Err(format!("git clone failed: {}", r.stderr).into());
         }
@@ -248,18 +509,26 @@ fn init_server(
     // Append shell tools + COPY + deps install to Dockerfile
     let extra = r#"# Shell tools: zsh, neovim, oh-my-zsh, utilities
 RUN apt-get update && \
-    apt-get install -y zsh neovim fzf bat fd-find ripgrep curl locales tmux && \
+    apt-get install -y zsh neovim fzf bat fd-find ripgrep curl locales sudo ncurses-term && \
     locale-gen en_US.UTF-8 && \
     rm -rf /var/lib/apt/lists/*
 
-# Oh My Zsh (unattended)
+# Zellij (session persistence)
+RUN curl -L https://github.com/zellij-org/zellij/releases/latest/download/zellij-x86_64-unknown-linux-musl.tar.gz | tar xz -C /usr/local/bin
+
+# Create non-root user with sudo access
+RUN useradd -m -s /bin/zsh -G sudo dev && \
+    echo 'dev ALL=(ALL) NOPASSWD:ALL' >> /etc/sudoers
+
+# Oh My Zsh for dev user
+USER dev
+ENV HOME=/home/dev
 RUN sh -c "$(curl -fsSL https://raw.githubusercontent.com/ohmyzsh/ohmyzsh/master/tools/install.sh)" "" --unattended && \
-    git clone --depth=1 https://github.com/zsh-users/zsh-autosuggestions ${ZSH_CUSTOM:-/root/.oh-my-zsh/custom}/plugins/zsh-autosuggestions 2>/dev/null && \
-    git clone --depth=1 https://github.com/zsh-users/zsh-syntax-highlighting ${ZSH_CUSTOM:-/root/.oh-my-zsh/custom}/plugins/zsh-syntax-highlighting 2>/dev/null && \
-    chsh -s /bin/zsh root
+    git clone --depth=1 https://github.com/zsh-users/zsh-autosuggestions ${ZSH_CUSTOM:-$HOME/.oh-my-zsh/custom}/plugins/zsh-autosuggestions 2>/dev/null && \
+    git clone --depth=1 https://github.com/zsh-users/zsh-syntax-highlighting ${ZSH_CUSTOM:-$HOME/.oh-my-zsh/custom}/plugins/zsh-syntax-highlighting 2>/dev/null
 
 # Custom arrow theme + zshrc
-RUN cat > /root/.oh-my-zsh/custom/themes/arrow-custom.zsh-theme << 'THEMEEOF'
+RUN cat > /home/dev/.oh-my-zsh/custom/themes/arrow-custom.zsh-theme << 'THEMEEOF'
 NCOLOR="white"
 ICON_GIT=$'\uf418'
 ICON_TIMER=$'\uf520'
@@ -300,13 +569,13 @@ function git_info() {
 }
 local root_indicator=""
 [ $UID -eq 0 ] && root_indicator="%F{196}[root] %f"
-PROMPT='${root_indicator}%F{$NCOLOR}%c ➤ %f'
+PROMPT='${root_indicator}%F{yellow}tgv%f %F{$NCOLOR}%c ➤ %f'
 RPROMPT='$(cmd_duration)$(git_info)'
 export LSCOLORS="exfxcxdxbxbxbxbxbxbxbx"
 export LS_COLORS="di=34;40:ln=35;40:so=32;40:pi=33;40:ex=31;40:bd=31;40:cd=31;40:su=31;40:sg=31;40:tw=31;40:ow=31;40:"
 THEMEEOF
 
-RUN cat > /root/.zshrc << 'ZSHEOF'
+RUN cat > /home/dev/.zshrc << 'ZSHEOF'
 export ZSH="$HOME/.oh-my-zsh"
 ZSH_THEME="arrow-custom"
 plugins=(git zsh-autosuggestions zsh-syntax-highlighting)
@@ -314,6 +583,8 @@ source $ZSH/oh-my-zsh.sh
 
 export EDITOR='nvim'
 export LANG=en_US.UTF-8
+export COLORTERM=truecolor
+export PATH="$HOME/.local/bin:$PATH"
 
 alias vim='nvim'
 alias ll='ls -la --color=auto'
@@ -323,7 +594,7 @@ command -v fdfind &>/dev/null && alias fd='fdfind'
 ZSHEOF
 
 # Minimal nvim config (no plugins, no network)
-RUN mkdir -p /root/.config/nvim && cat > /root/.config/nvim/init.lua << 'NVIMEOF'
+RUN mkdir -p /home/dev/.config/nvim && cat > /home/dev/.config/nvim/init.lua << 'NVIMEOF'
 vim.opt.number = true
 vim.opt.relativenumber = true
 vim.opt.tabstop = 2
@@ -344,13 +615,22 @@ vim.keymap.set("n", "<leader>w", ":w<CR>")
 vim.keymap.set("n", "<leader>q", ":q<CR>")
 NVIMEOF
 
+USER root
 COPY repo /workspace/repo
+RUN chown -R dev:dev /workspace/repo
+USER dev
 WORKDIR /workspace/repo
 RUN if [ -f pnpm-lock.yaml ]; then pnpm install && (grep -q '"prepare"' package.json 2>/dev/null && pnpm prepare || true); elif [ -f package-lock.json ]; then npm install; elif [ -f yarn.lock ]; then npm install -g yarn && yarn install; fi
 "#;
-    server::ssh_run(&config, &format!("cat >> /tmp/tgv-build/Dockerfile << 'EOF'\n{extra}EOF"))?;
+    server::ssh_run(
+        &config,
+        &format!("cat >> /tmp/tgv-build/Dockerfile << 'EOF'\n{extra}EOF"),
+    )?;
 
-    let r = server::ssh_run(&config, &format!("docker build -t {} /tmp/tgv-build", config.docker.image))?;
+    let r = server::ssh_run(
+        &config,
+        &format!("docker build -t {} /tmp/tgv-build", config.docker.image),
+    )?;
     if !r.success {
         return Err(format!("Docker build failed:\n{}", r.stderr).into());
     }
@@ -358,13 +638,22 @@ RUN if [ -f pnpm-lock.yaml ]; then pnpm install && (grep -q '"prepare"' package.
     println!("  Docker image built");
 
     // Docker network
-    let net = server::ssh_run(&config, &format!("docker network inspect {}", config.docker.network))?;
+    let net = server::ssh_run(
+        &config,
+        &format!("docker network inspect {}", config.docker.network),
+    )?;
     if !net.success {
-        server::ssh_run(&config, &format!("docker network create {}", config.docker.network))?;
+        server::ssh_run(
+            &config,
+            &format!("docker network create {}", config.docker.network),
+        )?;
     }
     println!("  Network ready");
 
     config.save()?;
-    println!("\nConfig saved. Run `tgv` to open the session manager.");
+    println!(
+        "\n{} Run `tgv` to open the session manager.",
+        style("Config saved.").green()
+    );
     Ok(())
 }

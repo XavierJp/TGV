@@ -6,6 +6,7 @@
 use crate::config::Config;
 use std::path::PathBuf;
 use std::process::Command;
+use std::time::Instant;
 
 /// Result of a remote SSH command
 pub struct CmdResult {
@@ -25,7 +26,6 @@ fn control_path(config: &Config) -> PathBuf {
             let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
         }
     }
-    // Use a short hash of the target instead of the full user@host string
     use std::collections::hash_map::DefaultHasher;
     use std::hash::{Hash, Hasher};
     let mut h = DefaultHasher::new();
@@ -47,21 +47,38 @@ fn ssh_mux_args(config: &Config) -> Vec<String> {
     ]
 }
 
+/// Log SSH timing if TGV_DEBUG is set
+fn log_ssh(label: &str, cmd: &str, elapsed: std::time::Duration, result: &CmdResult) {
+    if std::env::var("TGV_DEBUG").is_ok() {
+        let status = if result.success { "ok" } else { "FAIL" };
+        let ms = elapsed.as_millis();
+        let short_cmd: String = cmd.chars().take(80).collect();
+        eprintln!("[tgv {ms:>5}ms {status}] {label}: {short_cmd}");
+        if !result.success && !result.stderr.is_empty() {
+            let stderr_short: String = result.stderr.chars().take(200).collect();
+            eprintln!("[tgv stderr] {stderr_short}");
+        }
+    }
+}
+
 /// Run a command on the remote server via SSH
 pub fn ssh_run(config: &Config, command: &str) -> Result<CmdResult, Box<dyn std::error::Error>> {
     let mut args = ssh_mux_args(config);
     args.push(config.ssh_target());
     args.push(command.to_string());
 
+    let start = Instant::now();
     let output = Command::new("ssh")
         .args(&args)
         .output()?;
 
-    Ok(CmdResult {
+    let result = CmdResult {
         success: output.status.success(),
         stdout: String::from_utf8_lossy(&output.stdout).trim().to_string(),
         stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
-    })
+    };
+    log_ssh("ssh_run", command, start.elapsed(), &result);
+    Ok(result)
 }
 
 /// Copy a local file to the remote server
@@ -71,6 +88,7 @@ pub fn scp_to(
     remote_path: &str,
 ) -> Result<CmdResult, Box<dyn std::error::Error>> {
     let cp = control_path(config);
+    let start = Instant::now();
     let output = Command::new("scp")
         .args([
             "-o", "ConnectTimeout=10",
@@ -82,11 +100,13 @@ pub fn scp_to(
         ])
         .output()?;
 
-    Ok(CmdResult {
+    let result = CmdResult {
         success: output.status.success(),
         stdout: String::from_utf8_lossy(&output.stdout).trim().to_string(),
         stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
-    })
+    };
+    log_ssh("scp_to", remote_path, start.elapsed(), &result);
+    Ok(result)
 }
 
 /// Write a string to a remote file via stdin (never on command line)
@@ -118,36 +138,41 @@ pub fn scp_string_to(
     Ok(())
 }
 
-/// Fast SSH ping with a short 3s timeout (reuses ControlMaster if available)
-pub fn ssh_ping(config: &Config) -> Result<CmdResult, Box<dyn std::error::Error>> {
-    let cp = control_path(config);
-    let output = Command::new("ssh")
-        .args([
-            "-o", "ConnectTimeout=3",
-            "-o", "StrictHostKeyChecking=accept-new",
-            "-o", &format!("ControlPath={}", cp.display()),
-            "-o", "ControlMaster=auto",
-            "-o", "ControlPersist=600",
-            &config.ssh_target(),
-            "true",
-        ])
-        .output()?;
+/// Run a remote command, feeding data to its stdin (avoids heredoc quoting issues)
+pub fn ssh_write_stdin(
+    config: &Config,
+    command: &str,
+    data: &[u8],
+) -> Result<CmdResult, Box<dyn std::error::Error>> {
+    use std::io::Write;
+    let mut args = ssh_mux_args(config);
+    args.push(config.ssh_target());
+    args.push(command.to_string());
 
-    Ok(CmdResult {
+    let start = Instant::now();
+    let mut child = Command::new("ssh")
+        .args(&args)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()?;
+
+    // Write data and close stdin immediately so remote command gets EOF
+    {
+        let stdin = child.stdin.take().expect("stdin was piped");
+        let mut writer = std::io::BufWriter::new(stdin);
+        writer.write_all(data)?;
+        writer.flush()?;
+        // stdin drops here, closing the pipe → remote cat gets EOF
+    }
+
+    let output = child.wait_with_output()?;
+    let result = CmdResult {
         success: output.status.success(),
-        stdout: String::new(),
-        stderr: String::new(),
-    })
+        stdout: String::from_utf8_lossy(&output.stdout).trim().to_string(),
+        stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
+    };
+    log_ssh("ssh_stdin", command, start.elapsed(), &result);
+    Ok(result)
 }
 
-/// Tear down the ControlMaster socket (call on exit)
-pub fn close_mux(config: &Config) {
-    let cp = control_path(config);
-    let _ = Command::new("ssh")
-        .args([
-            "-o", &format!("ControlPath={}", cp.display()),
-            "-O", "exit",
-            &config.ssh_target(),
-        ])
-        .output();
-}

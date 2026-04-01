@@ -5,23 +5,15 @@ edition = "2024"
 description = "Terminal à Grande Vitesse — remote Claude Code session manager"
 
 [dependencies]
-# TUI framework + terminal backend
-ratatui = "0.29"
-crossterm = "0.28"
-
-# Embedded terminal widget (PTY + vt100 parsing)
-tui-term = "0.2"
-portable-pty = "0.8"
-vt100 = "0.15"
-bytes = "1"
-
 # CLI argument parsing
 clap = { version = "4", features = ["derive"] }
+
+# Terminal styling + interactive prompts
+console = "0.15"
+dialoguer = { version = "0.11", features = ["fuzzy-select"] }
 
 # Config file (TOML)
 toml = "0.8"
 serde = { version = "1", features = ["derive"] }
 dirs = "6"
 
-# Misc
-which = "7"

@@ -10,7 +10,7 @@ fn config_dir() -> PathBuf {
         .join(".tgv")
 }
 
-pub fn config_file() -> PathBuf {
+fn config_file() -> PathBuf {
     config_dir().join("config.toml")
 }
 
@@ -19,12 +19,6 @@ pub fn config_file() -> PathBuf {
 pub struct ServerConfig {
     pub host: String,
     pub user: String,
-    #[serde(default = "default_et_port")]
-    pub et_port: u16,
-}
-
-fn default_et_port() -> u16 {
-    2022
 }
 
 /// Docker image and network settings
@@ -97,6 +91,15 @@ impl Config {
         }
         let contents = std::fs::read_to_string(&path)?;
         let config: Config = toml::from_str(&contents)?;
+        // Validate config values that end up in shell commands
+        let safe = |s: &str| !s.is_empty() && s.len() < 256
+            && s.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | '/' | ':'));
+        if !safe(&config.docker.image) {
+            return Err(format!("Invalid docker.image: {}", config.docker.image).into());
+        }
+        if !safe(&config.docker.network) {
+            return Err(format!("Invalid docker.network: {}", config.docker.network).into());
+        }
         Ok(config)
     }
 

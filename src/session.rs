@@ -81,136 +81,99 @@ fn session_name(repo_url: &str) -> String {
     format!("{}-{}", repo, &hash[..8.min(hash.len())])
 }
 
-/// Shell scripts for tmux status bar — written as heredocs inside the container.
-/// Not inside format!() so $ and " are safe.
-const TMUX_SETUP: &str = r##"# tmux status bar
-mkdir -p /usr/local/bin
-
-cat > /usr/local/bin/tgv-status-left << 'SLEOF'
-#!/bin/bash
-cd /workspace/repo 2>/dev/null || exit 0
-branch=$(git symbolic-ref --short HEAD 2>/dev/null || git rev-parse --short HEAD 2>/dev/null || echo "?")
-dirty=$(git status --porcelain 2>/dev/null)
-if [ -n "$(git status --porcelain 2>/dev/null)" ]; then state=" *"; else state=""; fi
-wins=$(tmux list-windows -t tgv -F '#{window_name} #{window_active}' 2>/dev/null | while read wname wactive; do
-  if [ "$wactive" = "1" ]; then printf "[%s] " "$wname"; else printf "%s " "$wname"; fi
-done)
-echo " $branch$state | $wins"
-SLEOF
-chmod +x /usr/local/bin/tgv-status-left
-
-cat > /usr/local/bin/tgv-status-right << 'SREOF'
-#!/bin/bash
-cd /workspace/repo 2>/dev/null || exit 0
-staged=$(git diff --cached --numstat 2>/dev/null | wc -l | tr -d ' ')
-modified=$(git diff --numstat 2>/dev/null | wc -l | tr -d ' ')
-untracked=$(git ls-files --others --exclude-standard 2>/dev/null | wc -l | tr -d ' ')
-parts=""
-staged=$(git diff --cached --numstat 2>/dev/null | wc -l | tr -d ' ')
-modified=$(git diff --numstat 2>/dev/null | wc -l | tr -d ' ')
-untracked=$(git ls-files --others --exclude-standard 2>/dev/null | wc -l | tr -d ' ')
-ch=""
-[ "$staged" -gt 0 ] 2>/dev/null && ch="+${staged} "
-[ "$modified" -gt 0 ] 2>/dev/null && ch="${ch}~${modified} "
-[ "$untracked" -gt 0 ] 2>/dev/null && ch="${ch}?${untracked}"
-[ -n "$ch" ] && parts="$ch"
-epoch=$(git log -1 --format=%ct 2>/dev/null)
-if [ -n "$epoch" ]; then
-  now=$(date +%s); d=$((now - epoch))
-  if [ $d -lt 60 ]; then age="${d}s"
-  elif [ $d -lt 3600 ]; then age="$((d/60))m"
-  elif [ $d -lt 86400 ]; then age="$((d/3600))h"
-  else age="$((d/86400))d"; fi
-  [ -n "$parts" ] && parts="$parts | $age" || parts="$age"
-fi
-printf "%s " "$parts"
-SREOF
-chmod +x /usr/local/bin/tgv-status-right
-
-cat > /root/.tmux.conf << 'TMUXEOF'
-set -g mouse on
-set -g terminal-overrides 'xterm*:smcup@:rmcup@'
-set -g history-limit 50000
-set -g default-terminal "xterm-256color"
-set -g default-shell /bin/zsh
-set -g status-position bottom
-set -g status 2
-set -g status-interval 5
-set -g status-style 'bg=default,fg=white'
-
-# Line 0: border (thin line matching tgv rounded borders)
-set -g status-format[0] '#[fg=brightblack,bg=default,fill=default]────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────'
-
-# Line 1: git info
-set -g status-format[1] '#[bg=default] #(tgv-status-left)#[align=right]#(tgv-status-right) '
-
-set -g status-left ''
-set -g status-right ''
-set -g status-left-length 0
-set -g status-right-length 0
-set -g window-status-format ''
-set -g window-status-current-format ''
-TMUXEOF
+/// Zellij config + layout for Claude Code sessions.
+const ZELLIJ_SETUP: &str = r##"mkdir -p /home/dev/.config/zellij/layouts
+cat > /home/dev/.config/zellij/config.kdl << 'CFGEOF'
+default_shell "zsh"
+pane_frames false
+default_layout "tgv"
+mouse_mode true
+scrollback_editor "nvim"
+theme "default"
+show_release_notes false
+show_startup_tips false
+CFGEOF
+cat > /home/dev/.config/zellij/layouts/tgv.kdl << 'LAYEOF'
+layout {
+    pane command="claude" {
+        args "--dangerously-skip-permissions"
+    }
+    pane size=1 borderless=true {
+        plugin location="compact-bar"
+    }
+}
+LAYEOF
 "##;
 
 /// Spawn a new session container on the given branch.
-pub fn spawn(config: &Config, branch: &str) -> Result<String, Box<dyn std::error::Error>> {
+/// Calls `on_step` with a message before each SSH operation.
+pub fn spawn(
+    config: &Config,
+    branch: &str,
+    on_step: impl Fn(&str),
+) -> Result<String, Box<dyn std::error::Error>> {
     validate_branch(branch).map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
     let name = session_name(&config.repo.url);
 
+    let git_config = if !config.git.name.is_empty() && !config.git.email.is_empty() {
+        format!(
+            "git config --global user.name '{}'\ngit config --global user.email '{}'",
+            config.git.name.replace('\'', "'\\''"),
+            config.git.email.replace('\'', "'\\''"),
+        )
+    } else {
+        String::new()
+    };
+
     let script = format!(
         r#"#!/bin/bash
-# Load OAuth token from mounted secret
+# OAuth token — write to .zshenv so ALL zsh processes get it (including zellij commands)
 if [ -f /run/secrets/claude_token ]; then
-  export CLAUDE_CODE_OAUTH_TOKEN=$(cat /run/secrets/claude_token)
+  echo "export CLAUDE_CODE_OAUTH_TOKEN=$(cat /run/secrets/claude_token)" > /home/dev/.zshenv
+  chmod 600 /home/dev/.zshenv
 fi
 
-# Pre-configure Claude Code (skip onboarding, dark theme, trust workspace)
-cat > /root/.claude.json << 'CFGEOF'
-{{"theme": "dark", "hasCompletedOnboarding": true}}
+# Claude Code settings — skip onboarding, trust workspace, allow all tools
+mkdir -p /home/dev/.claude
+cat > /home/dev/.claude/settings.json << 'CFGEOF'
+{{"permissions":{{"allow":["*"],"deny":[]}}}}
 CFGEOF
-mkdir -p /root/.claude/projects/-workspace-repo
-cat > /root/.claude/projects/-workspace-repo/settings.local.json << 'SETEOF'
-{{"isTrusted": true}}
-SETEOF
+cat > /home/dev/.claude.json << 'CFGEOF'
+{{"theme":"dark","hasCompletedOnboarding":true}}
+CFGEOF
 
-# Git identity
+# Project-level settings to mark workspace as trusted
+mkdir -p /workspace/repo/.claude
+cat > /workspace/repo/.claude/settings.local.json << 'CFGEOF'
+{{"permissions":{{"allow":["*"],"deny":[]}}}}
+CFGEOF
+
 {git_config}
-
-{tmux_setup}
-
+{zellij_setup}
 cd /workspace/repo
 git checkout -b {branch} 2>/dev/null || git checkout {branch} 2>&1
 exec sleep infinity
 "#,
-        git_config = if !config.git.name.is_empty() && !config.git.email.is_empty() {
-            format!(
-                "git config --global user.name '{}'\ngit config --global user.email '{}'",
-                config.git.name.replace('\'', "'\\''"),
-                config.git.email.replace('\'', "'\\''"),
-            )
-        } else {
-            String::new()
-        },
-        tmux_setup = TMUX_SETUP,
+        zellij_setup = ZELLIJ_SETUP,
     );
 
-    ssh_run(config, "mkdir -p /tmp/tgv-scripts")?;
-    ssh_run(
+    // Step 1: prepare scripts dir + write entrypoint via stdin (not heredoc — avoids quoting issues)
+    on_step("Preparing entrypoint");
+    ssh_run(config, "mkdir -p /tmp/tgv-scripts && chmod 700 /tmp/tgv-scripts")?;
+    crate::server::ssh_write_stdin(
         config,
-        &format!(
-            "cat > /tmp/tgv-scripts/{name}.sh << 'SCRIPT_EOF'\n{script}SCRIPT_EOF"
-        ),
+        &format!("cat > /tmp/tgv-scripts/{name}.sh && chmod +x /tmp/tgv-scripts/{name}.sh"),
+        script.as_bytes(),
     )?;
-    ssh_run(config, &format!("chmod +x /tmp/tgv-scripts/{name}.sh"))?;
 
-    // Write token to a temp file on the server (not in docker env, avoids docker inspect leak)
-    ssh_run(config, &format!(
-        "echo $CLAUDE_CODE_OAUTH_TOKEN > /tmp/tgv-scripts/{name}.token && chmod 600 /tmp/tgv-scripts/{name}.token"
-    ))?;
+    // Step 2: token (non-fatal — sessions work without it, just need manual login)
+    on_step("Configuring auth token");
+    let _ = ssh_run(config, &format!(
+        "cat ~/.config/tgv/oauth_token > /tmp/tgv-scripts/{name}.token 2>/dev/null; chmod 600 /tmp/tgv-scripts/{name}.token 2>/dev/null; true"
+    ));
 
-    // Named volumes persist workspace and Claude state across container restarts
-    // Token mounted as a file, read by entrypoint — not visible in docker inspect
+    // Step 3: docker run
+    on_step("Starting container");
     let docker_cmd = format!(
         "docker run -d \
          --name {name} \
@@ -218,9 +181,10 @@ exec sleep infinity
          --label tgv.repo={repo} \
          --label tgv.branch={branch} \
          -e TERM=xterm-256color \
+         -e COLORTERM=truecolor \
          -e LANG=C.UTF-8 \
          -v tgv-workspace-{name}:/workspace/repo \
-         -v tgv-claude-{name}:/root/.claude \
+         -v tgv-claude-{name}:/home/dev/.claude \
          -v /tmp/tgv-scripts/{name}.sh:/entrypoint.sh:ro \
          -v /tmp/tgv-scripts/{name}.token:/run/secrets/claude_token:ro \
          {image} \
@@ -243,6 +207,9 @@ pub fn list_sessions(config: &Config) -> Result<Vec<Session>, Box<dyn std::error
                --format '{{.Names}}\t{{.Label \"tgv.repo\"}}\t{{.Label \"tgv.branch\"}}\t{{.Status}}\t{{.CreatedAt}}'";
 
     let result = ssh_run(config, cmd)?;
+    if !result.success {
+        return Err(format!("Failed to list sessions: {}", result.stderr).into());
+    }
     if result.stdout.is_empty() {
         return Ok(Vec::new());
     }
@@ -294,7 +261,7 @@ pub fn git_metrics(
         return Err(format!("Invalid container name: {name}").into());
     }
     let cmd = format!(
-        "docker exec {name} bash -c 'cd /workspace/repo 2>/dev/null || exit 0; \
+        "docker exec -u dev {name} bash -c 'cd /workspace/repo 2>/dev/null || exit 0; \
          git diff --shortstat 2>/dev/null; git diff --cached --shortstat 2>/dev/null'"
     );
     let result = ssh_run(config, &cmd)?;
@@ -324,19 +291,14 @@ pub fn git_metrics(
     })
 }
 
-/// Build the docker exec command to attach to a tmux window.
-/// Self-bootstraps: creates session + window if needed. Race-safe.
-pub fn tmux_attach_cmd(container: &str, window: &str, command: &str) -> String {
-    // All inputs are validated — container from docker ps (checked in list_sessions),
-    // window is hardcoded "claude", command is hardcoded "claude".
-    debug_assert!(is_shell_safe(container) && is_shell_safe(window));
+/// Build the docker exec command to attach to a zellij session.
+/// Creates the session on first attach (uses the tgv layout which starts claude).
+/// On subsequent attaches, reattaches to the existing session.
+pub fn attach_cmd(container: &str) -> String {
+    debug_assert!(is_shell_safe(container));
     format!(
-        "docker exec -it {container} bash -c '\
-         tmux new-session -d -s tgv -c /workspace/repo 2>/dev/null; \
-         tmux select-window -t tgv:{window} 2>/dev/null || \
-           {{ tmux new-window -t tgv -n {window} -c /workspace/repo && \
-              tmux send-keys -t tgv:{window} \"{command}\" Enter; }}; \
-         SHELL=/bin/zsh exec tmux attach-session -t tgv:{window}'"
+        "docker exec -u dev -it -w /workspace/repo {container} \
+         zellij attach tgv --create"
     )
 }
 
