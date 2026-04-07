@@ -35,8 +35,10 @@ Remote AI coding sessions on your own server. Spawn isolated OpenCode containers
 ```bash
 git clone https://github.com/XavierJp/TGV.git
 cd TGV
-cargo install --path .
+./install.sh
 ```
+
+This builds the binary, installs it to `~/.cargo/bin/tgv`, and links the xbar menu bar plugin if xbar is installed.
 
 ---
 
@@ -76,12 +78,6 @@ Inside each session, OpenCode runs with Qwen 3 Coder via OpenRouter. A Zellij sp
 
 Detach with `Ctrl+Q`. Reattach anytime — sessions persist.
 
-### Refresh API key
-
-```bash
-tgv auth
-```
-
 ### xbar plugin
 
 A menu bar plugin is included at `xbar/tgv.30s.sh`. Symlink it to see active sessions in your macOS menu bar:
@@ -114,14 +110,6 @@ name = "Your Name"
 email = "you@example.com"
 ```
 
----
-
-## Security
-
-- No secrets in Docker image layers
-- API key mounted as read-only Docker secret
-- Private repo tokens used only for clone, then cleaned up
-- Optional network allowlist via `docker/network-allowlist.sh`
 
 ---
 

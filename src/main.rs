@@ -84,9 +84,6 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Refresh OpenRouter API key on the server
-    Auth,
-
     /// Bootstrap a remote server for tgv sessions
     Init {
         /// Server address (e.g., user@10.0.0.1)
@@ -112,13 +109,6 @@ fn main() {
     let cli = Cli::parse();
 
     match cli.command {
-        Some(Commands::Auth) => {
-            let config = load_config();
-            if let Err(e) = refresh_auth(&config) {
-                eprintln!("{} {e}", style("Error:").red().bold());
-                std::process::exit(1);
-            }
-        }
         Some(Commands::Init {
             host,
             repo,
@@ -424,43 +414,6 @@ fn attach(config: &Config, container: &str) -> Result<(), Box<dyn std::error::Er
     Ok(())
 }
 
-
-/// Update OpenRouter API key on the server + all running containers
-fn refresh_auth(config: &Config) -> Result<(), Box<dyn std::error::Error>> {
-    banner::print_banner();
-    eprintln!("  {}", style(config.ssh_target()).dim());
-    eprintln!();
-    connect(config)?;
-
-    // Prompt for OpenRouter API key
-    let api_key: String = dialoguer::Password::with_theme(&tgv_theme())
-        .with_prompt("OpenRouter API key")
-        .interact()?;
-
-    let api_key = api_key.trim().to_string();
-    if api_key.is_empty() {
-        return Err("API key cannot be empty".into());
-    }
-
-    // Save to server
-    server::ssh_run(config, "mkdir -p ~/.config/tgv && chmod 700 ~/.config/tgv")?;
-    server::scp_string_to(config, &api_key, "~/.config/tgv/openrouter_key", "600")?;
-
-    // Push fresh key into all running tgv containers
-    let sessions = session::list_sessions(config)?;
-    for s in &sessions {
-        if s.status == "running" {
-            eprintln!("  Updating {}...", s.branch);
-            let _ = server::ssh_run(config, &format!(
-                "docker cp ~/.config/tgv/openrouter_key {}:/run/secrets/openrouter_key 2>/dev/null; true",
-                s.name
-            ));
-        }
-    }
-
-    eprintln!("  {}", style("API key refreshed.").green());
-    Ok(())
-}
 
 /// Run `tgv init` to bootstrap a remote server.
 fn init_server(
