@@ -4,11 +4,11 @@
 
 # TGV — Terminal à Grande Vitesse
 
-In the AI era, internet connection must be a given. In high latency environment, such as high speed rail, internet instability make coding session a bit frustrating.
+In the AI era, a reliable internet connection should be a given. In high-latency environments, such as high-speed rail, unstable internet can make coding sessions frustrating.
 
-Enters TGV, a tools to spawn remote session on your workhorse remote server. Remote server has good connection even when you dont.
+Enter TGV, a tool that spawns remote sessions on your workhorse server. 
 
-TGV spawn isolated yolo containers that runs opencode with open router. TGV is resilient. Your code keep running even when your wifi does not.
+TGV spins up isolated YOLO containers that run OpenCode with OpenRouter. They run on the remote server which keeps a stable connection even when you don’t.
 
 ---
 
