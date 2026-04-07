@@ -1,8 +1,7 @@
-FROM node:22-slim
+FROM ubuntu:24.04
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     git \
-    tmux \
     build-essential \
     python3 \
     curl \
@@ -17,10 +16,22 @@ RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
     && apt-get update && apt-get install -y --no-install-recommends gh \
     && rm -rf /var/lib/apt/lists/*
 
-# Install pnpm and Claude Code
-RUN npm install -g pnpm @anthropic-ai/claude-code
+# Install Node.js 23
+RUN curl -fsSL https://deb.nodesource.com/setup_23.x | bash - \
+    && apt-get install -y nodejs \
+    && npm install -g pnpm \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install uv (Python package manager)
+RUN curl -LsSf https://astral.sh/uv/install.sh | sh \
+    && cp -L /root/.local/bin/uv /usr/local/bin/uv \
+    && chmod 755 /usr/local/bin/uv
+
+# Install Claude Code (native binary)
+RUN curl -fsSL https://claude.ai/install.sh | bash \
+    && cp -L /root/.local/bin/claude /usr/local/bin/claude \
+    && chmod 755 /usr/local/bin/claude
 
 WORKDIR /workspace
 
 # Repo clone + deps install are appended by tgv init
-# using --build-arg GH_TOKEN for private repos

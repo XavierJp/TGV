@@ -84,6 +84,9 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
+    /// Refresh Claude Code credentials on the server
+    Auth,
+
     /// Bootstrap a remote server for tgv sessions
     Init {
         /// Server address (e.g., user@10.0.0.1)
@@ -109,6 +112,13 @@ fn main() {
     let cli = Cli::parse();
 
     match cli.command {
+        Some(Commands::Auth) => {
+            let config = load_config();
+            if let Err(e) = refresh_auth(&config) {
+                eprintln!("{} {e}", style("Error:").red().bold());
+                std::process::exit(1);
+            }
+        }
         Some(Commands::Init {
             host,
             repo,
@@ -160,7 +170,7 @@ fn connect(config: &Config) -> Result<(), Box<dyn std::error::Error>> {
 
 fn fetch_sessions(config: &Config) -> Result<Vec<Session>, Box<dyn std::error::Error>> {
     let sessions = with_spinner("Fetching sessions", || session::list_sessions(config))?;
-    Ok(with_spinner("Loading git stats", || {
+    let mut sessions: Vec<Session> = with_spinner("Loading git stats", || {
         sessions
             .into_iter()
             .map(|mut s| {
@@ -173,7 +183,23 @@ fn fetch_sessions(config: &Config) -> Result<Vec<Session>, Box<dyn std::error::E
                 s
             })
             .collect()
-    }))
+    });
+
+    // Fetch PR info (runs locally, fast)
+    // Extract repo slug from URL (e.g. "https://github.com/org/repo" → "org/repo")
+    let repo_slug = config.repo.url
+        .trim_end_matches('/')
+        .trim_end_matches(".git")
+        .rsplit("github.com/")
+        .next()
+        .unwrap_or("");
+    if !repo_slug.is_empty() {
+        with_spinner("Checking PRs", || {
+            session::fetch_prs(repo_slug, &mut sessions);
+        });
+    }
+
+    Ok(sessions)
 }
 
 fn tgv_theme() -> ColorfulTheme {
@@ -190,21 +216,77 @@ fn tgv_theme() -> ColorfulTheme {
 
 fn format_session(s: &Session) -> String {
     let icon = if s.status == "running" { "●" } else { "○" };
-    let mut parts = vec![s.repo.clone()];
+    let label = if let Some(ref dn) = s.display_name {
+        format!("{dn} ({})", s.branch)
+    } else {
+        s.branch.clone()
+    };
+
+    let mut meta = Vec::new();
     if let Some(ins) = s.insertions {
-        parts.push(format!("+{ins}"));
+        meta.push(format!("+{ins}"));
     }
     if let Some(del) = s.deletions {
-        parts.push(format!("-{del}"));
+        meta.push(format!("-{del}"));
     }
-    format!("{icon}  {}  ╌  {}", s.branch, parts.join(" · "))
+    if let Some(ref pr) = s.pr {
+        meta.push(format!("PR #{} {}", pr.number, pr.title));
+    }
+
+    if meta.is_empty() {
+        format!("{icon}  {label}")
+    } else {
+        format!("{icon}  {label}  ╌  {}", meta.join("  "))
+    }
 }
 
 fn print_header(config: &Config) {
     eprint!("\x1b[2J\x1b[H"); // clear screen + cursor home
     banner::print_banner();
-    eprintln!("  {}", style(config.ssh_target()).dim());
+    eprintln!(
+        "  {}  ╌  {}",
+        style(config.ssh_target()).dim(),
+        style(&config.repo.url).dim()
+    );
     eprintln!();
+}
+
+/// Let the user pick a remote branch or create a new one
+fn pick_branch(
+    config: &Config,
+    theme: &dialoguer::theme::ColorfulTheme,
+) -> Result<Option<String>, Box<dyn std::error::Error>> {
+    let branches = with_spinner("Fetching branches", || session::list_branches(config))?;
+
+    let mut items = Vec::new();
+    items.push("⊕ New branch (random name)".to_string());
+    items.push("⊕ New branch (custom name)".to_string());
+    for b in &branches {
+        items.push(format!("  {b}"));
+    }
+
+    let selection = FuzzySelect::with_theme(theme)
+        .with_prompt("Branch")
+        .items(&items)
+        .default(0)
+        .interact_opt()?;
+
+    match selection {
+        None => Ok(None),
+        Some(0) => Ok(Some(session::random_branch_name())),
+        Some(1) => {
+            let name: String = dialoguer::Input::with_theme(theme)
+                .with_prompt("Branch name")
+                .interact_text()?;
+            let name = name.trim().to_string();
+            if name.is_empty() {
+                Ok(Some(session::random_branch_name()))
+            } else {
+                Ok(Some(name))
+            }
+        }
+        Some(i) => Ok(Some(branches[i - 2].clone())),
+    }
 }
 
 /// Interactive session picker
@@ -232,15 +314,9 @@ fn interactive(config: &Config) -> Result<(), Box<dyn std::error::Error>> {
         };
 
         if selection == sessions.len() {
-            let branch: String = dialoguer::Input::with_theme(&theme)
-                .with_prompt("Branch (empty for random)")
-                .allow_empty(true)
-                .interact_text()?;
-
-            let branch = if branch.trim().is_empty() {
-                session::random_branch_name()
-            } else {
-                branch.trim().to_string()
+            let branch = pick_branch(config, &theme)?;
+            let Some(branch) = branch else {
+                continue;
             };
 
             let name = {
@@ -251,17 +327,17 @@ fn interactive(config: &Config) -> Result<(), Box<dyn std::error::Error>> {
             };
             eprintln!("  {} {name}", style("Created").green());
             attach(config, &name)?;
-            return Ok(());
+            continue;
         }
 
         // Action picker
         print_header(config);
         let s = &sessions[selection];
         let action_label = if s.status == "running" { "▶ Attach" } else { "▶ Restart & attach" };
-        let actions = &[action_label, "✕ Kill", "‹ Back"];
+        let actions = &[action_label, "✎ Rename", "⟳ Update auth", "✕ Kill", "‹ Back"];
 
         let action = FuzzySelect::with_theme(&theme)
-            .with_prompt(&s.branch)
+            .with_prompt(&format_session(s))
             .items(actions)
             .default(0)
             .interact_opt()?;
@@ -275,9 +351,32 @@ fn interactive(config: &Config) -> Result<(), Box<dyn std::error::Error>> {
                     });
                 }
                 attach(config, &s.name)?;
-                return Ok(());
+                continue;
             }
             Some(1) => {
+                let new_name: String = dialoguer::Input::with_theme(&theme)
+                    .with_prompt("Display name")
+                    .with_initial_text(s.display_name.as_deref().unwrap_or(""))
+                    .interact_text()?;
+                let new_name = new_name.trim().to_string();
+                if !new_name.is_empty() {
+                    session::rename(config, &s.name, &new_name)?;
+                }
+                continue;
+            }
+            Some(2) => {
+                // Update auth — inject Claude + GitHub credentials into running container
+                if s.status == "running" {
+                    with_spinner(&format!("Updating auth for {}", s.name), || {
+                        inject_auth(config, &s.name);
+                    });
+                    eprintln!("  {}", style("Auth updated").green());
+                } else {
+                    eprintln!("  {}", style("Container not running").yellow());
+                }
+                continue;
+            }
+            Some(3) => {
                 let name = s.name.clone();
                 let branch = s.branch.clone();
                 with_spinner(&format!("Killing {name}"), || {
@@ -291,21 +390,122 @@ fn interactive(config: &Config) -> Result<(), Box<dyn std::error::Error>> {
     }
 }
 
-/// Attach to a session — takes over the terminal via SSH
+/// Attach to a session — tries mosh (local echo), falls back to SSH
 fn attach(config: &Config, container: &str) -> Result<(), Box<dyn std::error::Error>> {
     let docker_cmd = session::attach_cmd(container);
-    let ssh_target = config.ssh_target();
-    println!(
-        "{}",
-        style(format!("Attaching to {container}...")).dim()
-    );
-    let status = std::process::Command::new("ssh")
-        .args(["-t", &ssh_target, &docker_cmd])
-        .status()?;
+    let has_mosh = std::process::Command::new("which")
+        .arg("mosh")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+
+    let status = if has_mosh {
+        eprintln!(
+            "{}",
+            style(format!("Attaching via mosh to {container}...")).dim()
+        );
+        // mosh --ssh="ssh options" user@host -- command
+        let result = std::process::Command::new("mosh")
+            .args([
+                &format!("{}@{}", config.server.user, config.server.host),
+                "--",
+                "bash", "-c", &docker_cmd,
+            ])
+            .status()?;
+
+        if result.success() {
+            return Ok(());
+        }
+        eprintln!("{}", style("mosh failed, falling back to SSH...").yellow());
+        std::process::Command::new("ssh")
+            .args(["-t", &config.ssh_target(), &docker_cmd])
+            .status()?
+    } else {
+        eprintln!(
+            "{}",
+            style(format!("Attaching via SSH to {container}...")).dim()
+        );
+        std::process::Command::new("ssh")
+            .args(["-t", &config.ssh_target(), &docker_cmd])
+            .status()?
+    };
 
     if !status.success() {
         return Err("Connection closed".into());
     }
+    Ok(())
+}
+
+/// Inject fresh Claude + GitHub credentials into a running container
+fn inject_auth(config: &Config, container: &str) {
+    // Claude credentials
+    let _ = server::ssh_run(config, &format!(
+        "docker cp ~/.config/tgv/credentials.json {container}:/home/dev/.claude/.credentials.json 2>/dev/null; \
+         docker exec {container} chown dev:dev /home/dev/.claude/.credentials.json 2>/dev/null; \
+         docker exec {container} chmod 600 /home/dev/.claude/.credentials.json 2>/dev/null; true"
+    ));
+
+    // GitHub token — get from local `gh` and push into container
+    let gh_token = std::process::Command::new("gh")
+        .args(["auth", "token"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string());
+
+    if let Some(token) = gh_token {
+        let hosts_yml = format!(
+            "github.com:\n    oauth_token: {token}\n    git_protocol: https\n"
+        );
+        // Write via stdin to avoid token on command line
+        let _ = server::ssh_write_stdin(config, &format!(
+            "docker exec {container} mkdir -p /home/dev/.config/gh && \
+             docker exec -i {container} sh -c 'cat > /home/dev/.config/gh/hosts.yml' && \
+             docker exec {container} chown -R dev:dev /home/dev/.config/gh && \
+             docker exec {container} chmod 600 /home/dev/.config/gh/hosts.yml && \
+             docker exec -u dev {container} git config --global credential.https://github.com.helper \"!gh auth git-credential\""
+        ), hosts_yml.as_bytes());
+    }
+}
+
+/// Re-login and refresh credentials on the server + all running containers
+fn refresh_auth(config: &Config) -> Result<(), Box<dyn std::error::Error>> {
+    banner::print_banner();
+    eprintln!("  {}", style(config.ssh_target()).dim());
+    eprintln!();
+    connect(config)?;
+
+    let claude_bin = "PATH=$PATH:$HOME/.local/bin:/usr/local/bin";
+
+    // Run interactive login on the server
+    eprintln!("  {}", style("Opening Claude Code login...").dim());
+    let status = std::process::Command::new("ssh")
+        .args([
+            "-t",
+            &config.ssh_target(),
+            &format!("{claude_bin} && claude /login"),
+        ])
+        .status()?;
+
+    if !status.success() {
+        return Err("Login failed".into());
+    }
+
+    // Copy fresh credentials to tgv config
+    server::ssh_run(config,
+        "mkdir -p ~/.config/tgv && cp ~/.claude/.credentials.json ~/.config/tgv/credentials.json 2>/dev/null; chmod 600 ~/.config/tgv/credentials.json"
+    )?;
+
+    // Push fresh credentials into all running tgv containers
+    let sessions = session::list_sessions(config)?;
+    for s in &sessions {
+        if s.status == "running" {
+            eprintln!("  Updating {}...", s.branch);
+            inject_auth(config, &s.name);
+        }
+    }
+
+    eprintln!("  {}", style("Credentials refreshed.").green());
     Ok(())
 }
 
@@ -389,6 +589,11 @@ fn init_server(
             "Docker",
             "curl -fsSL https://get.docker.com | sh",
         ),
+        (
+            "mosh-server --version",
+            "mosh",
+            "sudo apt install -y mosh",
+        ),
         ("git --version", "git", "sudo apt install -y git"),
     ] {
         let r = server::ssh_run(&config, cmd)?;
@@ -403,8 +608,8 @@ fn init_server(
         }
     }
 
-    // Claude Code binary path (native installer puts it in ~/.claude/local/bin)
-    let claude_bin = "PATH=$PATH:$HOME/.claude/local/bin:$HOME/.local/bin:/usr/local/bin";
+    // Claude Code binary path (native installer puts it in ~/.local/bin)
+    let claude_bin = "PATH=$PATH:$HOME/.local/bin:/usr/local/bin";
 
     // Install Claude Code on server if missing
     let claude_check = server::ssh_run(
@@ -427,39 +632,43 @@ fn init_server(
         }
         server::ssh_run(
             &config,
-            "grep -q '.claude/local/bin' ~/.bashrc 2>/dev/null || echo 'export PATH=$PATH:$HOME/.claude/local/bin' >> ~/.bashrc",
+            "grep -q '.local/bin' ~/.bashrc 2>/dev/null || echo 'export PATH=$PATH:$HOME/.local/bin' >> ~/.bashrc",
         )?;
         println!("  ✓ Claude Code installed");
     }
 
     // Setup Claude Code auth on the server
     println!("Setting up Claude Code auth on server...");
-    let check = server::ssh_run(&config, "cat ~/.config/tgv/oauth_token 2>/dev/null")?;
-    if check.stdout.trim().is_empty() {
-        println!("  No token found on server. Running claude setup-token remotely...");
+    let has_creds = server::ssh_run(&config, "test -f ~/.config/tgv/credentials.json")?;
+    if !has_creds.success {
+        println!("  No credentials found on server. Running claude login remotely...");
         println!("  ⚠ This will print a URL — open it in your browser to authenticate.");
         println!();
+
+        // Interactive login — allocates TTY so the user can complete OAuth
         let status = std::process::Command::new("ssh")
             .args([
                 "-t",
                 &config.ssh_target(),
-                &format!("{claude_bin} && claude setup-token"),
+                &format!("{claude_bin} && claude /login"),
             ])
             .status()?;
+
         if !status.success() {
-            eprintln!("  ⚠ claude setup-token failed — sessions will require manual login");
+            eprintln!("  ⚠ claude login failed — sessions will require manual /login");
         } else {
-            server::ssh_run(&config, &format!(
-                "{claude_bin} && mkdir -p ~/.config/tgv && echo \"$CLAUDE_CODE_OAUTH_TOKEN\" > ~/.config/tgv/oauth_token && chmod 600 ~/.config/tgv/oauth_token"
-            ))?;
-            server::ssh_run(
-                &config,
-                "grep -q 'tgv/oauth_token' ~/.bashrc 2>/dev/null || echo 'export CLAUDE_CODE_OAUTH_TOKEN=$(cat ~/.config/tgv/oauth_token 2>/dev/null)' >> ~/.bashrc",
+            // Copy credentials to tgv's config dir for mounting into containers
+            server::ssh_run(&config,
+                "mkdir -p ~/.config/tgv && chmod 700 ~/.config/tgv"
             )?;
-            println!("  Token configured on server");
+            // Copy the credentials file Claude Code created
+            server::ssh_run(&config,
+                "cp ~/.claude/.credentials.json ~/.config/tgv/credentials.json 2>/dev/null; chmod 600 ~/.config/tgv/credentials.json"
+            )?;
+            println!("  Credentials configured on server");
         }
     } else {
-        println!("  Token already configured on server");
+        println!("  Credentials already configured on server");
     }
 
     // Build Docker image
@@ -621,6 +830,8 @@ RUN chown -R dev:dev /workspace/repo
 USER dev
 WORKDIR /workspace/repo
 RUN if [ -f pnpm-lock.yaml ]; then pnpm install && (grep -q '"prepare"' package.json 2>/dev/null && pnpm prepare || true); elif [ -f package-lock.json ]; then npm install; elif [ -f yarn.lock ]; then npm install -g yarn && yarn install; fi
+# Python deps — install uv projects found in subdirectories
+RUN find . -name "pyproject.toml" -maxdepth 2 -exec sh -c 'cd "$(dirname "{}")" && uv sync 2>/dev/null' \; || true
 "#;
     server::ssh_run(
         &config,
