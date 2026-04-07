@@ -143,7 +143,7 @@ fn session_name(repo_url: &str) -> String {
     format!("{}-{}", repo, &hash[..8.min(hash.len())])
 }
 
-/// Zellij config + layout for Claude Code sessions.
+/// Zellij config + layout for OpenCode sessions.
 const ZELLIJ_SETUP: &str = r##"mkdir -p /home/dev/.config/zellij/layouts
 cat > /home/dev/.config/zellij/config.kdl << 'CFGEOF'
 default_shell "zsh"
@@ -170,9 +170,7 @@ CFGEOF
 cat > /home/dev/.config/zellij/layouts/tgv.kdl << 'LAYEOF'
 layout {
     pane split_direction="vertical" {
-        pane command="/usr/local/bin/claude" size="70%" focus=true {
-            args "--dangerously-skip-permissions"
-        }
+        pane command="/usr/local/bin/opencode" size="70%" focus=true
         pane size="30%"
     }
     pane size=1 borderless=true {
@@ -206,26 +204,32 @@ pub fn spawn(
         r#"#!/bin/bash
 # Entrypoint runs as root — copies secrets, writes config, then drops to dev
 
-# Claude Code credentials — only seed if not already present (volume may have refreshed tokens)
-if [ ! -f /home/dev/.claude/.credentials.json ] && [ -f /run/secrets/claude_credentials ]; then
-  cp /run/secrets/claude_credentials /home/dev/.claude/.credentials.json
-  chmod 600 /home/dev/.claude/.credentials.json
+# OpenRouter API key — export for OpenCode
+if [ -f /run/secrets/openrouter_key ]; then
+  export OPENROUTER_API_KEY=$(cat /run/secrets/openrouter_key)
 fi
 
-# Claude Code settings
-if [ ! -f /home/dev/.claude/settings.json ]; then
-  cat > /home/dev/.claude/settings.json << 'CFGEOF'
-{{"permissions":{{"allow":["*"],"deny":[]}}}}
-CFGEOF
-fi
-cat > /home/dev/.claude.json << 'CFGEOF'
-{{"theme":"dark","hasCompletedOnboarding":true}}
+# OpenCode config — write opencode.json to workspace
+cat > /workspace/repo/opencode.json << 'CFGEOF'
+{{
+  "$schema": "https://opencode.ai/config.json",
+  "provider": {{
+    "openrouter": {{
+      "models": {{
+        "qwen/qwen3-coder": {{}},
+        "qwen/qwen3-coder:free": {{}}
+      }}
+    }}
+  }}
+}}
 CFGEOF
 
-# Project-level trust
-mkdir -p /workspace/repo/.claude
-cat > /workspace/repo/.claude/settings.local.json << 'CFGEOF'
-{{"permissions":{{"allow":["*"],"deny":[]}}}}
+# OpenCode TUI theme — inherit terminal colors
+cat > /workspace/repo/tui.json << 'CFGEOF'
+{{
+  "$schema": "https://opencode.ai/tui.json",
+  "theme": "tokyonight"
+}}
 CFGEOF
 
 # GitHub auth — configure git to use gh for HTTPS credentials
@@ -255,9 +259,12 @@ git config --global --add safe.directory /workspace/repo
 git fetch --all 2>/dev/null
 git checkout {branch} 2>/dev/null || git checkout -b {branch} origin/{branch} 2>/dev/null || git checkout -b {branch} 2>/dev/null
 
-# Fix ownership and drop to dev
-chown -R dev:dev /home/dev /workspace/repo/.claude
-exec su dev -c 'sleep infinity'
+# Fix ownership — volume is mounted at /mnt/opencode
+chown -R dev:dev /mnt/opencode
+mkdir -p /home/dev/.local/share
+ln -sfn /mnt/opencode /home/dev/.local/share/opencode
+chown -R dev:dev /home/dev /workspace/repo
+exec su dev -c 'export OPENROUTER_API_KEY=$(cat /run/secrets/openrouter_key 2>/dev/null); sleep infinity'
 "#,
         zellij_setup = ZELLIJ_SETUP,
     );
@@ -271,10 +278,10 @@ exec su dev -c 'sleep infinity'
         script.as_bytes(),
     )?;
 
-    // Step 2: credentials (non-fatal — sessions work without it, just need manual /login)
+    // Step 2: OpenRouter API key (non-fatal — sessions work without it, just need manual config)
     on_step("Configuring credentials");
     let _ = ssh_run(config, &format!(
-        "cp ~/.config/tgv/credentials.json /tmp/tgv-scripts/{name}.creds 2>/dev/null; chmod 644 /tmp/tgv-scripts/{name}.creds 2>/dev/null; true"
+        "cp ~/.config/tgv/openrouter_key /tmp/tgv-scripts/{name}.key 2>/dev/null; chmod 644 /tmp/tgv-scripts/{name}.key 2>/dev/null; true"
     ));
 
     // Step 2b: GitHub token from local machine (non-fatal)
@@ -299,9 +306,9 @@ exec su dev -c 'sleep infinity'
          -e COLORTERM=truecolor \
          -e LANG=C.UTF-8 \
          -v tgv-workspace-{name}:/workspace/repo \
-         -v tgv-claude-{name}:/home/dev/.claude \
+         -v tgv-opencode-{name}:/mnt/opencode \
          -v /tmp/tgv-scripts/{name}.sh:/entrypoint.sh:ro \
-         -v /tmp/tgv-scripts/{name}.creds:/run/secrets/claude_credentials:ro \
+         -v /tmp/tgv-scripts/{name}.key:/run/secrets/openrouter_key:ro \
          -v /tmp/tgv-scripts/{name}.gh:/run/secrets/gh_token:ro \
          {image} \
          bash /entrypoint.sh",
@@ -504,7 +511,7 @@ pub fn stop(config: &Config, name: &str) -> Result<(), Box<dyn std::error::Error
         return Err(format!("Invalid container name: {name}").into());
     }
     ssh_run(config, &format!("docker rm -f {name}"))?;
-    ssh_run(config, &format!("docker volume rm -f tgv-workspace-{name} tgv-claude-{name}"))?;
-    ssh_run(config, &format!("rm -f /tmp/tgv-scripts/{name}.sh /tmp/tgv-scripts/{name}.creds /tmp/tgv-scripts/{name}.gh"))?;
+    ssh_run(config, &format!("docker volume rm -f tgv-workspace-{name} tgv-opencode-{name}"))?;
+    ssh_run(config, &format!("rm -f /tmp/tgv-scripts/{name}.sh /tmp/tgv-scripts/{name}.key /tmp/tgv-scripts/{name}.gh"))?;
     Ok(())
 }

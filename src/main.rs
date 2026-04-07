@@ -1,6 +1,6 @@
 //! tgv — Terminal à Grande Vitesse
 //!
-//! Remote Claude Code session manager.
+//! Remote OpenCode session manager.
 //! `tgv init` bootstraps a server, `tgv` lists/attaches/creates sessions.
 
 mod banner;
@@ -74,7 +74,7 @@ fn with_spinner<T, F: FnOnce() -> T>(msg: &str, f: F) -> T {
     f()
 }
 
-/// Terminal à Grande Vitesse — remote Claude Code session manager
+/// Terminal à Grande Vitesse — remote OpenCode session manager
 #[derive(Parser)]
 #[command(name = "tgv", version, about)]
 struct Cli {
@@ -84,7 +84,7 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    /// Refresh Claude Code credentials on the server
+    /// Refresh OpenRouter API key on the server
     Auth,
 
     /// Bootstrap a remote server for tgv sessions
@@ -334,7 +334,7 @@ fn interactive(config: &Config) -> Result<(), Box<dyn std::error::Error>> {
         print_header(config);
         let s = &sessions[selection];
         let action_label = if s.status == "running" { "▶ Attach" } else { "▶ Restart & attach" };
-        let actions = &[action_label, "✎ Rename", "⟳ Update auth", "✕ Kill", "‹ Back"];
+        let actions = &[action_label, "✎ Rename", "✕ Kill", "‹ Back"];
 
         let action = FuzzySelect::with_theme(&theme)
             .with_prompt(&format_session(s))
@@ -365,18 +365,6 @@ fn interactive(config: &Config) -> Result<(), Box<dyn std::error::Error>> {
                 continue;
             }
             Some(2) => {
-                // Update auth — inject Claude + GitHub credentials into running container
-                if s.status == "running" {
-                    with_spinner(&format!("Updating auth for {}", s.name), || {
-                        inject_auth(config, &s.name);
-                    });
-                    eprintln!("  {}", style("Auth updated").green());
-                } else {
-                    eprintln!("  {}", style("Container not running").yellow());
-                }
-                continue;
-            }
-            Some(3) => {
                 let name = s.name.clone();
                 let branch = s.branch.clone();
                 with_spinner(&format!("Killing {name}"), || {
@@ -436,76 +424,41 @@ fn attach(config: &Config, container: &str) -> Result<(), Box<dyn std::error::Er
     Ok(())
 }
 
-/// Inject fresh Claude + GitHub credentials into a running container
-fn inject_auth(config: &Config, container: &str) {
-    // Claude credentials
-    let _ = server::ssh_run(config, &format!(
-        "docker cp ~/.config/tgv/credentials.json {container}:/home/dev/.claude/.credentials.json 2>/dev/null; \
-         docker exec {container} chown dev:dev /home/dev/.claude/.credentials.json 2>/dev/null; \
-         docker exec {container} chmod 600 /home/dev/.claude/.credentials.json 2>/dev/null; true"
-    ));
 
-    // GitHub token — get from local `gh` and push into container
-    let gh_token = std::process::Command::new("gh")
-        .args(["auth", "token"])
-        .output()
-        .ok()
-        .filter(|o| o.status.success())
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string());
-
-    if let Some(token) = gh_token {
-        let hosts_yml = format!(
-            "github.com:\n    oauth_token: {token}\n    git_protocol: https\n"
-        );
-        // Write via stdin to avoid token on command line
-        let _ = server::ssh_write_stdin(config, &format!(
-            "docker exec {container} mkdir -p /home/dev/.config/gh && \
-             docker exec -i {container} sh -c 'cat > /home/dev/.config/gh/hosts.yml' && \
-             docker exec {container} chown -R dev:dev /home/dev/.config/gh && \
-             docker exec {container} chmod 600 /home/dev/.config/gh/hosts.yml && \
-             docker exec -u dev {container} git config --global credential.https://github.com.helper \"!gh auth git-credential\""
-        ), hosts_yml.as_bytes());
-    }
-}
-
-/// Re-login and refresh credentials on the server + all running containers
+/// Update OpenRouter API key on the server + all running containers
 fn refresh_auth(config: &Config) -> Result<(), Box<dyn std::error::Error>> {
     banner::print_banner();
     eprintln!("  {}", style(config.ssh_target()).dim());
     eprintln!();
     connect(config)?;
 
-    let claude_bin = "PATH=$PATH:$HOME/.local/bin:/usr/local/bin";
+    // Prompt for OpenRouter API key
+    let api_key: String = dialoguer::Password::with_theme(&tgv_theme())
+        .with_prompt("OpenRouter API key")
+        .interact()?;
 
-    // Run interactive login on the server
-    eprintln!("  {}", style("Opening Claude Code login...").dim());
-    let status = std::process::Command::new("ssh")
-        .args([
-            "-t",
-            &config.ssh_target(),
-            &format!("{claude_bin} && claude /login"),
-        ])
-        .status()?;
-
-    if !status.success() {
-        return Err("Login failed".into());
+    let api_key = api_key.trim().to_string();
+    if api_key.is_empty() {
+        return Err("API key cannot be empty".into());
     }
 
-    // Copy fresh credentials to tgv config
-    server::ssh_run(config,
-        "mkdir -p ~/.config/tgv && cp ~/.claude/.credentials.json ~/.config/tgv/credentials.json 2>/dev/null; chmod 600 ~/.config/tgv/credentials.json"
-    )?;
+    // Save to server
+    server::ssh_run(config, "mkdir -p ~/.config/tgv && chmod 700 ~/.config/tgv")?;
+    server::scp_string_to(config, &api_key, "~/.config/tgv/openrouter_key", "600")?;
 
-    // Push fresh credentials into all running tgv containers
+    // Push fresh key into all running tgv containers
     let sessions = session::list_sessions(config)?;
     for s in &sessions {
         if s.status == "running" {
             eprintln!("  Updating {}...", s.branch);
-            inject_auth(config, &s.name);
+            let _ = server::ssh_run(config, &format!(
+                "docker cp ~/.config/tgv/openrouter_key {}:/run/secrets/openrouter_key 2>/dev/null; true",
+                s.name
+            ));
         }
     }
 
-    eprintln!("  {}", style("Credentials refreshed.").green());
+    eprintln!("  {}", style("API key refreshed.").green());
     Ok(())
 }
 
@@ -608,67 +561,27 @@ fn init_server(
         }
     }
 
-    // Claude Code binary path (native installer puts it in ~/.local/bin)
-    let claude_bin = "PATH=$PATH:$HOME/.local/bin:/usr/local/bin";
+    // Setup OpenRouter API key on the server
+    println!("Setting up OpenRouter auth on server...");
+    let has_key = server::ssh_run(&config, "test -f ~/.config/tgv/openrouter_key")?;
+    if !has_key.success {
+        println!("  No API key found on server.");
+        let api_key: String = dialoguer::Password::with_theme(&tgv_theme())
+            .with_prompt("OpenRouter API key")
+            .interact()?;
 
-    // Install Claude Code on server if missing
-    let claude_check = server::ssh_run(
-        &config,
-        &format!("{claude_bin} claude --version 2>/dev/null"),
-    )?;
-    if claude_check.success {
-        println!(
-            "  ✓ Claude Code: {}",
-            claude_check.stdout.lines().next().unwrap_or("")
-        );
-    } else {
-        println!("  Installing Claude Code on server...");
-        let install = server::ssh_run(
-            &config,
-            "bash -c 'curl -fsSL https://claude.ai/install.sh | bash'",
-        )?;
-        if !install.success {
-            return Err(format!("Failed to install Claude Code: {}", install.stderr).into());
-        }
-        server::ssh_run(
-            &config,
-            "grep -q '.local/bin' ~/.bashrc 2>/dev/null || echo 'export PATH=$PATH:$HOME/.local/bin' >> ~/.bashrc",
-        )?;
-        println!("  ✓ Claude Code installed");
-    }
-
-    // Setup Claude Code auth on the server
-    println!("Setting up Claude Code auth on server...");
-    let has_creds = server::ssh_run(&config, "test -f ~/.config/tgv/credentials.json")?;
-    if !has_creds.success {
-        println!("  No credentials found on server. Running claude login remotely...");
-        println!("  ⚠ This will print a URL — open it in your browser to authenticate.");
-        println!();
-
-        // Interactive login — allocates TTY so the user can complete OAuth
-        let status = std::process::Command::new("ssh")
-            .args([
-                "-t",
-                &config.ssh_target(),
-                &format!("{claude_bin} && claude /login"),
-            ])
-            .status()?;
-
-        if !status.success() {
-            eprintln!("  ⚠ claude login failed — sessions will require manual /login");
+        let api_key = api_key.trim().to_string();
+        if api_key.is_empty() {
+            eprintln!("  ⚠ No API key provided — sessions will need manual configuration");
         } else {
-            // Copy credentials to tgv's config dir for mounting into containers
             server::ssh_run(&config,
                 "mkdir -p ~/.config/tgv && chmod 700 ~/.config/tgv"
             )?;
-            // Copy the credentials file Claude Code created
-            server::ssh_run(&config,
-                "cp ~/.claude/.credentials.json ~/.config/tgv/credentials.json 2>/dev/null; chmod 600 ~/.config/tgv/credentials.json"
-            )?;
-            println!("  Credentials configured on server");
+            server::scp_string_to(&config, &api_key, "~/.config/tgv/openrouter_key", "600")?;
+            println!("  API key configured on server");
         }
     } else {
-        println!("  Credentials already configured on server");
+        println!("  API key already configured on server");
     }
 
     // Build Docker image

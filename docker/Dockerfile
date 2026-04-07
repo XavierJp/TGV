@@ -27,10 +27,10 @@ RUN curl -LsSf https://astral.sh/uv/install.sh | sh \
     && cp -L /root/.local/bin/uv /usr/local/bin/uv \
     && chmod 755 /usr/local/bin/uv
 
-# Install Claude Code (native binary)
-RUN curl -fsSL https://claude.ai/install.sh | bash \
-    && cp -L /root/.local/bin/claude /usr/local/bin/claude \
-    && chmod 755 /usr/local/bin/claude
+# Install OpenCode
+RUN curl -fsSL https://raw.githubusercontent.com/anomalyco/opencode/refs/heads/dev/install | bash \
+    && cp -L /root/.opencode/bin/opencode /usr/local/bin/opencode \
+    && chmod 755 /usr/local/bin/opencode
 
 WORKDIR /workspace
 
