@@ -233,10 +233,15 @@ fn format_session(s: &Session) -> String {
 fn print_header(config: &Config) {
     eprint!("\x1b[2J\x1b[H"); // clear screen + cursor home
     banner::print_banner();
+    let info = format!("{}  ╌  {}", config.ssh_target(), &config.repo.url);
+    let term_width = console::Term::stderr().size().1 as usize;
+    let pad = term_width.saturating_sub(info.chars().count()) / 2;
     eprintln!(
-        "  {}  ╌  {}",
+        "{:pad$}{}  ╌  {}",
+        "",
         style(config.ssh_target()).dim(),
-        style(&config.repo.url).dim()
+        style(&config.repo.url).dim(),
+        pad = pad
     );
     eprintln!();
 }

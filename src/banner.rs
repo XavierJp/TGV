@@ -19,13 +19,22 @@ const BANNER: [&str; 6] = [
 ];
 
 pub fn print_banner() {
+    let term_width = console::Term::stderr()
+        .size()
+        .1 as usize;
+    let banner_width = BANNER[0].chars().count();
+    let banner_pad = term_width.saturating_sub(banner_width) / 2;
+
+    let subtitle = "Terminal à Grande Vitesse";
+    let subtitle_pad = term_width.saturating_sub(subtitle.chars().count()) / 2;
+
     eprintln!();
     for (i, line) in BANNER.iter().enumerate() {
         let (r, g, b) = GRADIENT[i];
-        eprintln!("  \x1b[38;2;{r};{g};{b}m{line}\x1b[0m");
+        eprintln!("{:pad$}\x1b[38;2;{r};{g};{b}m{line}\x1b[0m", "", pad = banner_pad);
     }
     eprintln!();
     let (r, g, b) = GRADIENT[3];
-    eprintln!("  \x1b[3;38;2;{r};{g};{b}m        Terminal à Grande Vitesse\x1b[0m");
+    eprintln!("{:pad$}\x1b[3;38;2;{r};{g};{b}m{subtitle}\x1b[0m", "", pad = subtitle_pad);
     eprintln!();
 }

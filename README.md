@@ -2,13 +2,38 @@
   <img src="logo.png" alt="tgv" width="400" />
 </p>
 
-# tgv — Terminal à Grande Vitesse
+# TGV — Terminal à Grande Vitesse
 
-> TGV is brought to you by the Super Naive Code Factory (SNCF). This is a side project and not production ready.
+In the AI era, internet connection must be a given. In high latency environment, such as high speed rail, internet instability make coding session a bit frustrating.
 
-Remote AI coding sessions on your own server. Spawn isolated OpenCode containers, attach and detach resiliently. Your code keeps running even when your WiFi doesn't.
+Enters TGV, a tools to spawn remote session on your workhorse remote server. Remote server has good connection even when you dont.
+
+TGV spawn isolated yolo containers that runs opencode with open router. TGV is resilient. Your code keep running even when your wifi does not.
 
 ---
+
+## Installation
+
+```bash
+git clone https://github.com/XavierJp/TGV.git
+cd TGV
+./install.sh
+```
+
+This builds the binary, installs it to `~/.cargo/bin/tgv`, and links the xbar menu bar plugin if xbar is installed.
+
+## Usage
+
+The TUI lets you:
+
+- **New session** — pick a branch (or create one), spawn a container
+- **Attach** — connect to a running session via mosh/SSH
+- **Rename** — label sessions for easy identification
+- **Kill** — stop and clean up a session
+
+Inside each session, OpenCode runs with Qwen 3 Coder via OpenRouter. A Zellij split gives you a shell alongside the AI.
+
+Detach with `Ctrl+Q`. Reattach anytime — sessions persist.
 
 ## Requirements
 
@@ -27,20 +52,6 @@ Remote AI coding sessions on your own server. Spawn isolated OpenCode containers
 **API**
 
 - [OpenRouter](https://openrouter.ai) API key
-
----
-
-## Installation
-
-```bash
-git clone https://github.com/XavierJp/TGV.git
-cd TGV
-./install.sh
-```
-
-This builds the binary, installs it to `~/.cargo/bin/tgv`, and links the xbar menu bar plugin if xbar is installed.
-
----
 
 ## Setup
 
@@ -63,30 +74,13 @@ Then launch:
 tgv
 ```
 
----
-
-## Usage
-
-The TUI lets you:
-
-- **New session** — pick a branch (or create one), spawn a container
-- **Attach** — connect to a running session via mosh/SSH
-- **Rename** — label sessions for easy identification
-- **Kill** — stop and clean up a session
-
-Inside each session, OpenCode runs with Qwen 3 Coder via OpenRouter. A Zellij split gives you a shell alongside the AI.
-
-Detach with `Ctrl+Q`. Reattach anytime — sessions persist.
-
-### xbar plugin
+## xbar plugin
 
 A menu bar plugin is included at `xbar/tgv.30s.sh`. Symlink it to see active sessions in your macOS menu bar:
 
 ```bash
 ln -s $(pwd)/xbar/tgv.30s.sh ~/Library/Application\ Support/xbar/plugins/
 ```
-
----
 
 ## Configuration
 
@@ -109,9 +103,6 @@ default_branch = "main"
 name = "Your Name"
 email = "you@example.com"
 ```
-
-
----
 
 ## License
 
