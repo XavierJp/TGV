@@ -257,7 +257,14 @@ fi
 cd /workspace/repo
 git config --global --add safe.directory /workspace/repo
 git fetch --all 2>/dev/null
-git checkout {branch} 2>/dev/null || git checkout -b {branch} origin/{branch} 2>/dev/null || git checkout -b {branch} 2>/dev/null
+if git checkout {branch} 2>/dev/null; then
+  git pull --ff-only 2>/dev/null
+elif git checkout -b {branch} origin/{branch} 2>/dev/null; then
+  true
+else
+  git checkout origin/main 2>/dev/null
+  git checkout -b {branch} 2>/dev/null
+fi
 
 # Fix ownership — volume is mounted at /mnt/opencode
 chown -R dev:dev /mnt/opencode

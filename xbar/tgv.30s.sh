@@ -27,16 +27,25 @@ TARGET="$USER@$HOST"
 
 # Fetch sessions via SSH (reuse multiplexed connection if available)
 SOCKET="/tmp/tgv-s/$(echo "$TARGET" | shasum | cut -c1-8)"
-SSH_OPTS="-o ConnectTimeout=5 -o StrictHostKeyChecking=accept-new -o BatchMode=yes"
+SSH_BASE="-o ConnectTimeout=5 -o StrictHostKeyChecking=accept-new -o BatchMode=yes"
+DOCKER_CMD="docker ps -a --filter label=tgv.repo --format '{{.Names}}\t{{.Label \"tgv.branch\"}}\t{{.Status}}'"
+
+SSH_OPTS="$SSH_BASE"
 if [ -S "$SOCKET" ]; then
-  SSH_OPTS="$SSH_OPTS -o ControlPath=$SOCKET"
+  SSH_OPTS="$SSH_BASE -o ControlPath=$SOCKET"
 fi
 
-OUTPUT=$(ssh $SSH_OPTS "$TARGET" \
-  "docker ps -a --filter label=tgv.repo \
-   --format '{{.Names}}\t{{.Label \"tgv.branch\"}}\t{{.Status}}'" 2>/dev/null)
+OUTPUT=$(ssh $SSH_OPTS "$TARGET" "$DOCKER_CMD" 2>/dev/null)
+RC=$?
 
-if [ $? -ne 0 ]; then
+# If multiplexed socket failed, remove it and retry with a fresh connection
+if [ $RC -ne 0 ] && [ -S "$SOCKET" ]; then
+  rm -f "$SOCKET"
+  OUTPUT=$(ssh $SSH_BASE "$TARGET" "$DOCKER_CMD" 2>/dev/null)
+  RC=$?
+fi
+
+if [ $RC -ne 0 ]; then
   echo "▲"
   echo "---"
   echo "$TARGET"
