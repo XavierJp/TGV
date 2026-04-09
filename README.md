@@ -8,7 +8,7 @@ In the AI era, a reliable internet connection should be a given. In high-latency
 
 Enter TGV, a tool that spawns remote sessions on your workhorse server. 
 
-TGV spins up isolated YOLO containers that run OpenCode with OpenRouter. They run on the remote server which keeps a stable connection even when you don’t.
+TGV spins up isolated YOLO containers that run OpenCode with OpenRouter. They run on the remote server which keeps a stable connection even when you don't.
 
 ---
 
@@ -20,7 +20,17 @@ cd TGV
 ./install.sh
 ```
 
-This builds the binary, installs it to `~/.cargo/bin/tgv`, and links the xbar menu bar plugin if xbar is installed.
+This builds and installs:
+- `tgv` CLI to `~/.cargo/bin/tgv`
+- **TGVBar** native macOS menu bar app to `~/.local/bin/TGVBar` (auto-starts on login via LaunchAgent)
+
+## Uninstall
+
+```bash
+./uninstall.sh
+```
+
+Removes binaries, LaunchAgent, and optionally the `~/.tgv` config directory.
 
 ## Usage
 
@@ -35,10 +45,22 @@ Inside each session, OpenCode runs with Qwen 3 Coder via OpenRouter. A Zellij sp
 
 Detach with `Ctrl+Q`. Reattach anytime — sessions persist.
 
+## Menu bar app
+
+TGVBar is a native macOS menu bar app that shows your active sessions at a glance.
+
+- Train icon with running session count
+- Auto-refreshes every 30s
+- Detects network changes (e.g. Tailscale reconnect) and refreshes automatically
+- Click **Open TGV** to launch the TUI in Terminal
+- Starts automatically on login
+
 ## Requirements
 
 **Local machine (macOS)**
 
+- Rust toolchain (for building tgv)
+- Swift toolchain (for building TGVBar)
 - SSH (pre-installed)
 - [mosh](https://mosh.org/) (optional, for resilient connections)
 - [GitHub CLI](https://cli.github.com/) (for private repos)
@@ -72,14 +94,6 @@ Then launch:
 
 ```bash
 tgv
-```
-
-## xbar plugin
-
-A menu bar plugin is included at `xbar/tgv.30s.sh`. Symlink it to see active sessions in your macOS menu bar:
-
-```bash
-ln -s $(pwd)/xbar/tgv.30s.sh ~/Library/Application\ Support/xbar/plugins/
 ```
 
 ## Configuration

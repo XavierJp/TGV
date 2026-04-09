@@ -11,3 +11,5 @@ build/
 # Added by cargo
 
 /target
+
+/menubar/.build
