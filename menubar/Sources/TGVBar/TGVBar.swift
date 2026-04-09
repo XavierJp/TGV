@@ -15,15 +15,17 @@ struct TGVConfig {
         guard let contents = try? String(contentsOfFile: path, encoding: .utf8) else { return nil }
 
         func parse(_ key: String) -> String? {
+            let pattern = "^\(key)\\s*="
+            let regex = try? NSRegularExpression(pattern: pattern)
             for line in contents.components(separatedBy: "\n") {
                 let trimmed = line.trimmingCharacters(in: .whitespaces)
-                if trimmed.hasPrefix(key) {
-                    let parts = trimmed.components(separatedBy: "=")
-                    guard parts.count >= 2 else { continue }
-                    return parts.dropFirst().joined(separator: "=")
-                        .trimmingCharacters(in: .whitespaces)
-                        .trimmingCharacters(in: CharacterSet(charactersIn: "\""))
-                }
+                let range = NSRange(trimmed.startIndex..., in: trimmed)
+                guard regex?.firstMatch(in: trimmed, range: range) != nil else { continue }
+                let parts = trimmed.components(separatedBy: "=")
+                guard parts.count >= 2 else { continue }
+                return parts.dropFirst().joined(separator: "=")
+                    .trimmingCharacters(in: .whitespaces)
+                    .trimmingCharacters(in: CharacterSet(charactersIn: "\""))
             }
             return nil
         }
@@ -62,12 +64,12 @@ enum SSH {
 
         do {
             try proc.run()
-            proc.waitUntilExit()
         } catch {
             return (false, "")
         }
 
         let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        proc.waitUntilExit()
         let output = String(data: data, encoding: .utf8) ?? ""
         return (proc.terminationStatus == 0, output)
     }
@@ -139,7 +141,7 @@ func makeTrainIcon() -> NSImage {
 
 // MARK: - App Delegate
 
-class AppDelegate: NSObject, NSApplicationDelegate {
+class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var statusItem: NSStatusItem!
     private var refreshTimer: Timer?
     private let monitor = NWPathMonitor()
@@ -153,8 +155,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         if let button = statusItem.button {
             button.image = icon
             button.imagePosition = .imageLeading
-            button.action = #selector(menuWillOpen)
-            button.sendAction(on: [.leftMouseUp, .rightMouseUp])
         }
 
         config = TGVConfig.load()
@@ -179,11 +179,6 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         monitor.start(queue: DispatchQueue.global(qos: .utility))
 
         refresh()
-    }
-
-    @objc private func menuWillOpen() {
-        refresh()
-        statusItem.button?.performClick(nil)
     }
 
     private func refresh() {
@@ -333,13 +328,16 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         quitItem.target = self
         menu.addItem(quitItem)
 
+        menu.delegate = self
         statusItem.menu = menu
     }
 
+    func menuWillOpen(_ menu: NSMenu) {
+        refresh()
+    }
+
     @objc private func sessionClicked(_ sender: NSMenuItem) {
-        guard let name = sender.representedObject as? String else { return }
         openTerminal(command: "tgv")
-        _ = name // session context for future use
     }
 
     @objc private func openTGV() {

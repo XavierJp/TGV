@@ -16,7 +16,10 @@ echo "  Installed tgv to ~/.cargo/bin/tgv"
 # Menu bar app
 echo "Building TGVBar menu bar app..."
 cd "$SCRIPT_DIR/menubar"
-swift build -c release 2>&1 | tail -1
+if ! swift build -c release; then
+  echo "  Swift build failed"
+  exit 1
+fi
 INSTALL_DIR="$HOME/.local/bin"
 mkdir -p "$INSTALL_DIR"
 cp .build/release/TGVBar "$INSTALL_DIR/TGVBar"
@@ -43,8 +46,8 @@ cat > "$PLIST" << EOF
 </dict>
 </plist>
 EOF
-launchctl unload "$PLIST" 2>/dev/null || true
-launchctl load "$PLIST"
+launchctl bootout "gui/$(id -u)/com.tgv.bar" 2>/dev/null || true
+launchctl bootstrap "gui/$(id -u)" "$PLIST"
 echo "  TGVBar will start on login"
 
 cd "$SCRIPT_DIR"
