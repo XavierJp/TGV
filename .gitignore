@@ -7,9 +7,5 @@ dist/
 build/
 .eggs/
 
-
-# Added by cargo
-
-/target
-
-/menubar/.build
+/app/.build
+/app/.swiftpm

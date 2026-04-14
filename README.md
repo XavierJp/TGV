@@ -6,11 +6,17 @@
 
 In the AI era, a reliable internet connection should be a given. In high-latency environments, such as high-speed rail, unstable internet can make coding sessions frustrating.
 
-Enter TGV, a tool that spawns remote sessions on your workhorse server. 
+Enter TGV, a tool that spawns remote sessions on your workhorse server.
 
 TGV spins up isolated YOLO containers that run OpenCode with OpenRouter. They run on the remote server which keeps a stable connection even when you don't.
 
 ---
+
+## What's in the box
+
+- **TGV.app** — native macOS app with embedded SwiftTerm. Sidebar of sessions, center pane runs `tmux + opencode`, side panel has Terminal / Files / Git tabs.
+- **tgv-init** — bash script that builds the docker image (with your repo baked in) and writes the config the app reads.
+- **docker/Dockerfile** — image with `tmux`, `nvim`, `zsh + oh-my-zsh`, `gh`, `node`, `pnpm`, `uv`, `opencode` all preinstalled.
 
 ## Installation
 
@@ -21,8 +27,42 @@ cd TGV
 ```
 
 This builds and installs:
-- `tgv` CLI to `~/.cargo/bin/tgv`
-- **TGVBar** native macOS menu bar app to `~/.local/bin/TGVBar` (auto-starts on login via LaunchAgent)
+- `tgv-init` to `~/.local/bin/tgv-init`
+- The Dockerfile to `~/.local/share/tgv/Dockerfile`
+- `TGV.app` to `~/.local/bin/TGV` (auto-starts on login via LaunchAgent)
+
+## Setup
+
+```bash
+# Public repo
+tgv-init --host user@<server-ip> --repo https://github.com/org/repo
+
+# Private repo (requires `gh auth login` locally)
+tgv-init --host user@<server-ip> --repo https://github.com/org/repo --private
+
+# Custom branch
+tgv-init --host user@<server-ip> --repo https://github.com/org/repo --branch develop
+```
+
+`tgv-init` will:
+1. Check local + remote dependencies
+2. Prompt for your OpenRouter API key
+3. Clone the repo on the server, build the docker image with deps installed
+4. Create the docker network
+5. Save `~/.tgv/config.toml`
+
+Then launch the **TGV** app from your menu bar (or it'll already be running from the LaunchAgent).
+
+## Using the app
+
+- **Sidebar (left)** — list of sessions, `+ New Session` button, host metrics (CPU / GPU / RAM / Disk)
+- **Center** — `tmux` running `opencode` for the active session. `Ctrl+Q` to detach.
+- **Right panel** — three tabs:
+  - **Terminal** — raw `zsh` shell into the same container
+  - **Files** — `tree` view of the workspace
+  - **Git** — `watch git status` (auto-refreshes every 2s)
+
+Sessions persist across SSH disconnects via tmux, so you can close the app, reopen it, and pick up exactly where you left off.
 
 ## Uninstall
 
@@ -30,71 +70,25 @@ This builds and installs:
 ./uninstall.sh
 ```
 
-Removes binaries, LaunchAgent, and optionally the `~/.tgv` config directory.
-
-## Usage
-
-The TUI lets you:
-
-- **New session** — pick a branch (or create one), spawn a container
-- **Attach** — connect to a running session via mosh/SSH
-- **Rename** — label sessions for easy identification
-- **Kill** — stop and clean up a session
-
-Inside each session, OpenCode runs with Qwen 3 Coder via OpenRouter. A Zellij split gives you a shell alongside the AI.
-
-Detach with `Ctrl+Q`. Reattach anytime — sessions persist.
-
-## Menu bar app
-
-TGVBar is a native macOS menu bar app that shows your active sessions at a glance.
-
-- Train icon with running session count
-- Auto-refreshes every 30s
-- Detects network changes (e.g. Tailscale reconnect) and refreshes automatically
-- Click **Open TGV** to launch the TUI in Terminal
-- Starts automatically on login
+Removes binaries, LaunchAgent, and optionally `~/.tgv` config.
 
 ## Requirements
 
-**Local machine (macOS)**
+**Local machine (macOS 14+)**
 
-- Rust toolchain (for building tgv)
-- Swift toolchain (for building TGVBar)
+- Swift toolchain (for building the app)
 - SSH (pre-installed)
-- [mosh](https://mosh.org/) (optional, for resilient connections)
 - [GitHub CLI](https://cli.github.com/) (for private repos)
 
 **Remote server (Ubuntu/Debian)**
 
 - [Docker](https://get.docker.com)
-- mosh-server (`sudo apt install mosh`)
 - git
+- An SSH key you can authenticate with from your Mac
 
 **API**
 
 - [OpenRouter](https://openrouter.ai) API key
-
-## Setup
-
-```bash
-# Public repo
-tgv init --host user@<server-ip> --repo https://github.com/org/repo
-
-# Private repo
-tgv init --host user@<server-ip> --repo https://github.com/org/repo --private
-
-# Custom branch
-tgv init --host user@<server-ip> --repo https://github.com/org/repo --branch develop
-```
-
-You'll be prompted for your OpenRouter API key. This builds a Docker image with OpenCode, clones your repo, and installs dependencies.
-
-Then launch:
-
-```bash
-tgv
-```
 
 ## Configuration
 
@@ -116,6 +110,30 @@ default_branch = "main"
 [git]
 name = "Your Name"
 email = "you@example.com"
+```
+
+## Architecture
+
+```
+┌─────────────────────────────────────────────┐
+│  TGV.app (Swift + SwiftTerm + Citadel SSH)  │
+│  ┌──────┬─────────────┬─────────────┐       │
+│  │ Side │ Main        │ Side panel  │       │
+│  │ bar  │ (tmux +     │ Term/Files/ │       │
+│  │      │  opencode)  │ Git tabs    │       │
+│  └──────┴─────────────┴─────────────┘       │
+└─────────────────────────────────────────────┘
+                    │
+                    │  Single SSH connection (Citadel)
+                    │  Multiplexed PTY exec channels
+                    ▼
+┌─────────────────────────────────────────────┐
+│  Remote server                              │
+│  ┌─────────────┐  ┌─────────────┐           │
+│  │ container1  │  │ container2  │           │
+│  │ tmux+opencode│ │ tmux+opencode│          │
+│  └─────────────┘  └─────────────┘           │
+└─────────────────────────────────────────────┘
 ```
 
 ## License

@@ -1,7 +1,7 @@
 #!/bin/bash
 set -e
 
-echo "Uninstalling tgv..."
+echo "Uninstalling TGV..."
 
 # Stop and remove LaunchAgent
 PLIST="$HOME/Library/LaunchAgents/com.tgv.bar.plist"
@@ -11,16 +11,26 @@ if [ -f "$PLIST" ]; then
   echo "  Removed LaunchAgent"
 fi
 
-# Kill running TGVBar
-pkill TGVBar 2>/dev/null && echo "  Stopped TGVBar" || true
+# Kill running TGV
+pkill TGV 2>/dev/null && echo "  Stopped TGV" || true
 
-# Remove binaries
-for bin in "$HOME/.cargo/bin/tgv" "$HOME/.local/bin/TGVBar"; do
-  if [ -f "$bin" ]; then
-    rm -f "$bin"
-    echo "  Removed $bin"
+# Remove binaries + shared files
+for f in \
+  "$HOME/.local/bin/TGV" \
+  "$HOME/.local/bin/tgv-init" \
+  "$HOME/.local/share/tgv/Dockerfile"; do
+  if [ -f "$f" ]; then
+    rm -f "$f"
+    echo "  Removed $f"
   fi
 done
+rmdir "$HOME/.local/share/tgv" 2>/dev/null || true
+
+# Legacy Rust install (if present)
+if [ -f "$HOME/.cargo/bin/tgv" ]; then
+  rm -f "$HOME/.cargo/bin/tgv"
+  echo "  Removed legacy ~/.cargo/bin/tgv"
+fi
 
 # Config
 if [ -d "$HOME/.tgv" ]; then

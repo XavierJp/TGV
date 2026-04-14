@@ -1,0 +1,265 @@
+#!/usr/bin/env bash
+# tgv-init — bootstrap a remote TGV server
+#
+# Builds the TGV docker image with your repo baked in, sets up the docker
+# network, prompts for OpenRouter API key, and writes ~/.tgv/config.toml
+# for the TGV macOS app to read.
+
+set -euo pipefail
+
+# ─── Defaults ─────────────────────────────────────────────────────────────────
+
+BRANCH="main"
+PRIVATE=0
+HOST=""
+REPO=""
+
+DOCKER_IMAGE="tgv-session:latest"
+DOCKER_NETWORK="tgv-net"
+
+# Resolve location of the docker/Dockerfile. Search order:
+#   1. $TGV_DOCKERFILE env var (explicit override)
+#   2. ../docker/Dockerfile relative to this script (running from repo)
+#   3. ~/.local/share/tgv/Dockerfile (installed via install.sh)
+#   4. /usr/local/share/tgv/Dockerfile (system-wide install)
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+DOCKERFILE=""
+for candidate in \
+    "${TGV_DOCKERFILE:-}" \
+    "$SCRIPT_DIR/../docker/Dockerfile" \
+    "$HOME/.local/share/tgv/Dockerfile" \
+    "/usr/local/share/tgv/Dockerfile"; do
+    if [[ -n "$candidate" && -f "$candidate" ]]; then
+        DOCKERFILE="$candidate"
+        break
+    fi
+done
+
+# ─── Argument parsing ─────────────────────────────────────────────────────────
+
+usage() {
+    cat <<EOF
+Usage: tgv-init --host user@ip --repo <url> [--branch <name>] [--private]
+
+Options:
+  --host       SSH target (e.g. xavier@10.0.0.1)
+  --repo       Git repository URL (https:// or git@)
+  --branch     Default branch (default: main)
+  --private    Use 'gh auth token' to clone private repo
+
+Environment:
+  TGV_DOCKERFILE  Override path to docker/Dockerfile
+
+EOF
+    exit 1
+}
+
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        --host)    HOST="$2"; shift 2 ;;
+        --repo)    REPO="$2"; shift 2 ;;
+        --branch)  BRANCH="$2"; shift 2 ;;
+        --private) PRIVATE=1; shift ;;
+        -h|--help) usage ;;
+        *) echo "Unknown argument: $1" >&2; usage ;;
+    esac
+done
+
+[[ -z "$HOST" || -z "$REPO" ]] && usage
+
+if [[ -z "$DOCKERFILE" ]]; then
+    echo "✕ Cannot find docker/Dockerfile. Looked in:" >&2
+    echo "    \$TGV_DOCKERFILE (unset)" >&2
+    echo "    $SCRIPT_DIR/../docker/Dockerfile" >&2
+    echo "    $HOME/.local/share/tgv/Dockerfile" >&2
+    echo "    /usr/local/share/tgv/Dockerfile" >&2
+    echo "  Set TGV_DOCKERFILE or run install.sh from the TGV repo." >&2
+    exit 1
+fi
+
+# ─── Parse host into user@hostname ────────────────────────────────────────────
+
+if [[ "$HOST" == *"@"* ]]; then
+    USER_NAME="${HOST%@*}"
+    HOSTNAME="${HOST#*@}"
+else
+    USER_NAME="root"
+    HOSTNAME="$HOST"
+fi
+SSH_TARGET="$USER_NAME@$HOSTNAME"
+
+# ─── Validate inputs ──────────────────────────────────────────────────────────
+
+if [[ ! "$REPO" =~ ^https:// ]] && [[ ! "$REPO" =~ ^git@ ]]; then
+    echo "✕ Repo URL must start with https:// or git@" >&2
+    exit 1
+fi
+
+if [[ "$REPO" =~ [\;\|\&\`\$\(\)\{\}\<\>] ]]; then
+    echo "✕ Repo URL contains invalid characters" >&2
+    exit 1
+fi
+
+if [[ ! "$BRANCH" =~ ^[A-Za-z0-9._/-]+$ ]]; then
+    echo "✕ Invalid branch name: $BRANCH" >&2
+    exit 1
+fi
+
+# ─── Auto-detect git identity ─────────────────────────────────────────────────
+
+GIT_NAME="$(git config user.name 2>/dev/null || echo '')"
+GIT_EMAIL="$(git config user.email 2>/dev/null || echo '')"
+
+# ─── Check local deps ─────────────────────────────────────────────────────────
+
+echo "Checking local dependencies..."
+for bin in ssh scp; do
+    if ! command -v "$bin" >/dev/null 2>&1; then
+        echo "  ✗ Missing: $bin (install with: brew install openssh)" >&2
+        exit 1
+    fi
+done
+echo "  ✓ Local dependencies OK"
+
+# ─── SSH connectivity ─────────────────────────────────────────────────────────
+
+echo "Connecting to $SSH_TARGET..."
+if ! ssh -o ConnectTimeout=10 -o BatchMode=yes "$SSH_TARGET" "echo ok" >/dev/null 2>&1; then
+    echo "  ✗ Cannot connect to $SSH_TARGET" >&2
+    echo "  (Check the host, your SSH key, and network reachability.)" >&2
+    exit 1
+fi
+echo "  ✓ SSH OK"
+
+# ─── Check remote deps ────────────────────────────────────────────────────────
+
+echo "Checking remote dependencies..."
+check_remote() {
+    local cmd="$1" name="$2" hint="$3"
+    local version
+    if version=$(ssh "$SSH_TARGET" "$cmd" 2>/dev/null) && [[ -n "$version" ]]; then
+        echo "  ✓ $name: $(echo "$version" | head -n1)"
+    else
+        echo "  ✗ $name not installed — install with: $hint" >&2
+        exit 1
+    fi
+}
+check_remote "docker --version" "Docker"  "curl -fsSL https://get.docker.com | sh"
+check_remote "git --version"    "git"     "sudo apt install -y git"
+
+# ─── OpenRouter API key ───────────────────────────────────────────────────────
+
+echo "Setting up OpenRouter auth on server..."
+if ssh "$SSH_TARGET" "test -f ~/.config/tgv/openrouter_key" 2>/dev/null; then
+    echo "  ✓ API key already configured"
+else
+    echo "  No API key found on server."
+    read -rsp "  OpenRouter API key (input hidden): " API_KEY
+    echo
+    API_KEY="$(echo "$API_KEY" | tr -d '[:space:]')"
+    if [[ -z "$API_KEY" ]]; then
+        echo "  ⚠ No API key provided — sessions will need manual configuration"
+    else
+        ssh "$SSH_TARGET" "mkdir -p ~/.config/tgv && chmod 700 ~/.config/tgv"
+        printf '%s' "$API_KEY" | ssh "$SSH_TARGET" "cat > ~/.config/tgv/openrouter_key && chmod 600 ~/.config/tgv/openrouter_key"
+        echo "  ✓ API key uploaded"
+    fi
+fi
+
+# ─── Build Docker image ───────────────────────────────────────────────────────
+
+echo "Building Docker image with $REPO ($BRANCH)..."
+
+ssh "$SSH_TARGET" "rm -rf /tmp/tgv-build && mkdir -p /tmp/tgv-build"
+scp -q "$DOCKERFILE" "$SSH_TARGET:/tmp/tgv-build/Dockerfile"
+
+# Clone the repo on the SERVER (not in the docker layer) to avoid leaking
+# tokens into image history.
+if [[ $PRIVATE -eq 1 ]]; then
+    if ! command -v gh >/dev/null 2>&1; then
+        echo "✕ --private requires GitHub CLI (gh)" >&2
+        exit 1
+    fi
+    GH_TOKEN="$(gh auth token 2>/dev/null || true)"
+    if [[ -z "$GH_TOKEN" ]]; then
+        echo "✕ gh auth token failed — run 'gh auth login' first" >&2
+        exit 1
+    fi
+    echo "  ✓ GitHub token from gh"
+
+    REPO_PATH="${REPO#https://github.com/}"
+    ssh "$SSH_TARGET" "printf '#!/bin/sh\ncat /tmp/tgv-build/.git-token' > /tmp/tgv-build/.git-askpass && chmod 700 /tmp/tgv-build/.git-askpass"
+    printf '%s' "$GH_TOKEN" | ssh "$SSH_TARGET" "cat > /tmp/tgv-build/.git-token && chmod 600 /tmp/tgv-build/.git-token"
+    ssh "$SSH_TARGET" "GIT_ASKPASS=/tmp/tgv-build/.git-askpass git clone --branch $BRANCH https://x-access-token@github.com/$REPO_PATH /tmp/tgv-build/repo"
+    ssh "$SSH_TARGET" "rm -f /tmp/tgv-build/.git-askpass /tmp/tgv-build/.git-token"
+    ssh "$SSH_TARGET" "cd /tmp/tgv-build/repo && git remote set-url origin $REPO"
+else
+    if ! ssh "$SSH_TARGET" "git clone --branch $BRANCH $REPO /tmp/tgv-build/repo"; then
+        echo "✕ git clone failed" >&2
+        exit 1
+    fi
+fi
+
+# Append the repo COPY + dependency install steps to the Dockerfile
+ssh "$SSH_TARGET" "cat >> /tmp/tgv-build/Dockerfile" <<'EXTRADOCKERFILE'
+
+# Per-project: copy the cloned repo into /workspace/repo and install deps
+USER root
+COPY repo /workspace/repo
+RUN chown -R dev:dev /workspace/repo
+USER dev
+WORKDIR /workspace/repo
+
+RUN if [ -f pnpm-lock.yaml ]; then \
+      pnpm install && (grep -q '"prepare"' package.json 2>/dev/null && pnpm prepare || true); \
+    elif [ -f package-lock.json ]; then \
+      npm install; \
+    elif [ -f yarn.lock ]; then \
+      npm install -g yarn && yarn install; \
+    fi
+
+# Python deps — uv sync any pyproject.toml found in the repo root or one level deep
+RUN find . -name "pyproject.toml" -maxdepth 2 -exec sh -c 'cd "$(dirname "{}")" && uv sync 2>/dev/null' \; || true
+EXTRADOCKERFILE
+
+if ! ssh "$SSH_TARGET" "docker build -t $DOCKER_IMAGE /tmp/tgv-build"; then
+    echo "✕ Docker build failed" >&2
+    exit 1
+fi
+ssh "$SSH_TARGET" "rm -rf /tmp/tgv-build"
+echo "  ✓ Docker image built: $DOCKER_IMAGE"
+
+# ─── Docker network ───────────────────────────────────────────────────────────
+
+if ! ssh "$SSH_TARGET" "docker network inspect $DOCKER_NETWORK >/dev/null 2>&1"; then
+    ssh "$SSH_TARGET" "docker network create $DOCKER_NETWORK >/dev/null"
+fi
+echo "  ✓ Network ready: $DOCKER_NETWORK"
+
+# ─── Save config ──────────────────────────────────────────────────────────────
+
+mkdir -p "$HOME/.tgv"
+CONFIG="$HOME/.tgv/config.toml"
+
+cat > "$CONFIG" <<EOF
+[server]
+host = "$HOSTNAME"
+user = "$USER_NAME"
+
+[docker]
+image = "$DOCKER_IMAGE"
+network = "$DOCKER_NETWORK"
+
+[repo]
+url = "$REPO"
+default_branch = "$BRANCH"
+
+[git]
+name = "$GIT_NAME"
+email = "$GIT_EMAIL"
+EOF
+chmod 600 "$CONFIG"
+echo "  ✓ Config saved to $CONFIG"
+
+echo
+echo "Done. Launch the TGV app to manage sessions."

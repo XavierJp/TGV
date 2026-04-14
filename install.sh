@@ -2,31 +2,33 @@
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+INSTALL_DIR="$HOME/.local/bin"
+SHARE_DIR="$HOME/.local/share/tgv"
 
-echo "Installing tgv..."
+mkdir -p "$INSTALL_DIR" "$SHARE_DIR"
 
-# Build release binary
-cargo build --release
+echo "Installing TGV..."
 
-# Install to ~/.cargo/bin (already in PATH for Rust users)
-cp target/release/tgv ~/.cargo/bin/tgv
-codesign -fs - ~/.cargo/bin/tgv
-echo "  Installed tgv to ~/.cargo/bin/tgv"
+# 1. tgv-init bash script
+install -m 0755 "$SCRIPT_DIR/bin/tgv-init" "$INSTALL_DIR/tgv-init"
+echo "  Installed tgv-init to $INSTALL_DIR/tgv-init"
 
-# Menu bar app
-echo "Building TGVBar menu bar app..."
-cd "$SCRIPT_DIR/menubar"
+# 2. Dockerfile (referenced by tgv-init via TGV_DOCKERFILE)
+install -m 0644 "$SCRIPT_DIR/docker/Dockerfile" "$SHARE_DIR/Dockerfile"
+echo "  Installed Dockerfile to $SHARE_DIR/Dockerfile"
+
+# 3. Build the Swift menu bar / GUI app
+echo "Building TGV macOS app..."
+cd "$SCRIPT_DIR/app"
 if ! swift build -c release; then
   echo "  Swift build failed"
   exit 1
 fi
-INSTALL_DIR="$HOME/.local/bin"
-mkdir -p "$INSTALL_DIR"
-cp .build/release/TGVBar "$INSTALL_DIR/TGVBar"
-codesign -fs - "$INSTALL_DIR/TGVBar"
-echo "  Installed TGVBar to $INSTALL_DIR/TGVBar"
+cp .build/release/TGV "$INSTALL_DIR/TGV"
+codesign -fs - "$INSTALL_DIR/TGV"
+echo "  Installed TGV to $INSTALL_DIR/TGV"
 
-# Launch agent for auto-start
+# 4. LaunchAgent for auto-start
 PLIST="$HOME/Library/LaunchAgents/com.tgv.bar.plist"
 cat > "$PLIST" << EOF
 <?xml version="1.0" encoding="UTF-8"?>
@@ -37,8 +39,13 @@ cat > "$PLIST" << EOF
     <string>com.tgv.bar</string>
     <key>ProgramArguments</key>
     <array>
-        <string>$INSTALL_DIR/TGVBar</string>
+        <string>$INSTALL_DIR/TGV</string>
     </array>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>TGV_DOCKERFILE</key>
+        <string>$SHARE_DIR/Dockerfile</string>
+    </dict>
     <key>RunAtLoad</key>
     <true/>
     <key>KeepAlive</key>
@@ -48,7 +55,9 @@ cat > "$PLIST" << EOF
 EOF
 launchctl bootout "gui/$(id -u)/com.tgv.bar" 2>/dev/null || true
 launchctl bootstrap "gui/$(id -u)" "$PLIST"
-echo "  TGVBar will start on login"
+echo "  TGV will start on login"
 
 cd "$SCRIPT_DIR"
-echo "Done. Run: tgv init --host user@ip --repo <url>"
+echo
+echo "Done."
+echo "Next: tgv-init --host user@ip --repo https://github.com/org/repo"
