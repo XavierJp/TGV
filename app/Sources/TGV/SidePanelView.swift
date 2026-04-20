@@ -1,4 +1,5 @@
 import AppKit
+import Core
 
 /// Right-hand side panel for a session.
 /// Has a segmented header at the top with 3 tabs: Terminal / Files / Git.
@@ -10,7 +11,7 @@ final class SidePanelView: NSView {
         case git = 2
     }
 
-    private let segmented = NSSegmentedControl(labels: ["Terminal", "Files", "Git"],
+    private let segmented = NSSegmentedControl(labels: ["Terminal", "Explore", "Git"],
                                                 trackingMode: .selectOne,
                                                 target: nil, action: nil)
     private let collapseButton = NSButton()
@@ -48,7 +49,7 @@ final class SidePanelView: NSView {
 
         // Header with segmented control
         header.wantsLayer = true
-        header.layer?.backgroundColor = NSColor.windowBackgroundColor.cgColor
+        header.layer?.backgroundColor = NSColor(srgbRed: 0x1a/255, green: 0x1b/255, blue: 0x26/255, alpha: 1).cgColor
         header.translatesAutoresizingMaskIntoConstraints = false
 
         segmented.segmentStyle = .capsule
@@ -56,7 +57,7 @@ final class SidePanelView: NSView {
         segmented.segmentDistribution = .fit
         segmented.target = self
         segmented.action = #selector(segmentChanged)
-        segmented.selectedSegment = 0
+        segmented.selectedSegment = 2
         segmented.translatesAutoresizingMaskIntoConstraints = false
         header.addSubview(segmented)
 
@@ -83,8 +84,8 @@ final class SidePanelView: NSView {
         terminalContainer.translatesAutoresizingMaskIntoConstraints = false
         filesContainer.translatesAutoresizingMaskIntoConstraints = false
         gitContainer.translatesAutoresizingMaskIntoConstraints = false
+        terminalContainer.isHidden = true
         filesContainer.isHidden = true
-        gitContainer.isHidden = true
 
         // Install the native file tree in the files container
         fileTreeView.translatesAutoresizingMaskIntoConstraints = false
@@ -175,5 +176,11 @@ final class SidePanelView: NSView {
     func clearAllTerminals() {
         terminalView = nil
         // fileTreeView + gitStatusView are always present — content clears on next update
+    }
+
+    /// Route the bound session state through to the child views.
+    func bind(state: SessionState?) {
+        gitStatusView.bind(state: state)
+        fileTreeView.bind(state: state)
     }
 }

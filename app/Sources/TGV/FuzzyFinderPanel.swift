@@ -50,7 +50,7 @@ final class FuzzyFinderPanel: NSObject, NSTextFieldDelegate, NSTableViewDataSour
 
         // Search field
         searchField.placeholderString = "Go to file…"
-        searchField.font = NSFont.monospacedSystemFont(ofSize: 14, weight: .regular)
+        searchField.font = AppFont.regular(14)
         searchField.focusRingType = .none
         searchField.isBordered = false
         searchField.drawsBackground = false
@@ -221,13 +221,13 @@ final class FuzzyFinderPanel: NSObject, NSTextFieldDelegate, NSTableViewDataSour
         cell.wantsLayer = true
 
         let nameLabel = NSTextField(labelWithString: filename)
-        nameLabel.font = NSFont.monospacedSystemFont(ofSize: 12, weight: .medium)
+        nameLabel.font = AppFont.medium(12)
         nameLabel.textColor = .labelColor
         nameLabel.lineBreakMode = .byTruncatingTail
         nameLabel.translatesAutoresizingMaskIntoConstraints = false
 
         let dirLabel = NSTextField(labelWithString: dir.isEmpty ? "" : dir)
-        dirLabel.font = NSFont.monospacedSystemFont(ofSize: 10, weight: .regular)
+        dirLabel.font = AppFont.regular(10)
         dirLabel.textColor = .secondaryLabelColor
         dirLabel.lineBreakMode = .byTruncatingHead
         dirLabel.translatesAutoresizingMaskIntoConstraints = false

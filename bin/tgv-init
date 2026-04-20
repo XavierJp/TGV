@@ -147,25 +147,6 @@ check_remote() {
 check_remote "docker --version" "Docker"  "curl -fsSL https://get.docker.com | sh"
 check_remote "git --version"    "git"     "sudo apt install -y git"
 
-# ─── OpenRouter API key ───────────────────────────────────────────────────────
-
-echo "Setting up OpenRouter auth on server..."
-if ssh "$SSH_TARGET" "test -f ~/.config/tgv/openrouter_key" 2>/dev/null; then
-    echo "  ✓ API key already configured"
-else
-    echo "  No API key found on server."
-    read -rsp "  OpenRouter API key (input hidden): " API_KEY
-    echo
-    API_KEY="$(echo "$API_KEY" | tr -d '[:space:]')"
-    if [[ -z "$API_KEY" ]]; then
-        echo "  ⚠ No API key provided — sessions will need manual configuration"
-    else
-        ssh "$SSH_TARGET" "mkdir -p ~/.config/tgv && chmod 700 ~/.config/tgv"
-        printf '%s' "$API_KEY" | ssh "$SSH_TARGET" "cat > ~/.config/tgv/openrouter_key && chmod 600 ~/.config/tgv/openrouter_key"
-        echo "  ✓ API key uploaded"
-    fi
-fi
-
 # ─── Build Docker image ───────────────────────────────────────────────────────
 
 echo "Building Docker image with $REPO ($BRANCH)..."

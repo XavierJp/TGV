@@ -94,13 +94,27 @@ public actor SSHManager {
     }
 
     /// Run a non-interactive command and capture output.
+    /// On failure, clears the client so the next call will reconnect automatically.
     public func exec(_ command: String) async throws -> ExecResult {
-        try await connect()
-        guard let client = client else { throw SSHError.notConnected }
+        if client == nil {
+            try await connect()
+        }
+        guard let c = client else { throw SSHError.notConnected }
 
-        let buffer = try await client.executeCommand(command)
-        let stdout = String(buffer: buffer)
-        return ExecResult(stdout: stdout, stderr: "", exitCode: 0)
+        do {
+            let buffer = try await c.executeCommand(command)
+            let stdout = String(buffer: buffer)
+            return ExecResult(stdout: stdout, stderr: "", exitCode: 0)
+        } catch {
+            // Connection likely dead — clear so next exec triggers reconnect
+            self.client = nil
+            throw error
+        }
+    }
+
+    /// Force-reset the connection so the next exec will reconnect.
+    public func resetConnection() {
+        self.client = nil
     }
 
     /// Open a PTY session that runs `command` (typically a docker exec attach).

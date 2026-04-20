@@ -40,9 +40,10 @@ final class TerminalTabView: NSView, TerminalViewDelegate {
         layer?.backgroundColor = TerminalTheme.tokyoNight.background.cgColor
 
         terminalView.applyTheme(TerminalTheme.tokyoNight)
-        terminalView.font = NSFont(name: "FiraCode Nerd Font Mono", size: 12)
-            ?? NSFont(name: "FiraCodeNFM-Reg", size: 12)
-            ?? NSFont.monospacedSystemFont(ofSize: 12, weight: .regular)
+        terminalView.font = AppFont.regular(12)
+        // Disable mouse reporting so remote apps (tmux, claude, etc.) can't
+        // hijack mouse events — ensures click+drag selection and Cmd+C work.
+        terminalView.allowMouseReporting = false
         terminalView.translatesAutoresizingMaskIntoConstraints = false
         terminalView.terminalDelegate = self
         addSubview(terminalView)
@@ -69,6 +70,8 @@ final class TerminalTabView: NSView, TerminalViewDelegate {
 
         switch transport {
         case .mosh(let target, let command):
+            let debug = "[\(cols)x\(rows)] mosh \(target) -- \(command)\r\n"
+            terminalView.feed(byteArray: [UInt8](debug.utf8)[...])
             let session = MoshSession(onData: dataHandler)
             self.moshSession = session
             session.start(sshTarget: target, command: command, cols: cols, rows: rows)
@@ -170,4 +173,31 @@ final class TerminalTabView: NSView, TerminalViewDelegate {
     }
 
     func iTermContent(source: TerminalView, content: ArraySlice<UInt8>) {}
+
+    // MARK: - Scroll forwarding to tmux
+    // Since allowMouseReporting is false, SwiftTerm doesn't forward mouse events
+    // to the terminal. But we still need scroll wheel to reach tmux so it can
+    // scroll its scrollback (especially for alt-screen apps like Claude Code).
+    // We send raw SGR mouse wheel sequences directly via term.sendResponse.
+
+    override func scrollWheel(with event: NSEvent) {
+        guard event.deltaY != 0 else {
+            return super.scrollWheel(with: event)
+        }
+        let term = terminalView.getTerminal()
+        let cols = max(1, term.cols)
+        let rows = max(1, term.rows)
+        let point = terminalView.convert(event.locationInWindow, from: nil)
+        let cellW = terminalView.bounds.width / CGFloat(cols)
+        let cellH = terminalView.bounds.height / CGFloat(rows)
+        let col = max(1, min(cols, Int(point.x / cellW) + 1))
+        let row = max(1, min(rows, Int((terminalView.bounds.height - point.y) / cellH) + 1))
+
+        // SGR mouse encoding: button 64 = wheel up, 65 = wheel down
+        let button = event.deltaY > 0 ? 64 : 65
+        let count = max(1, min(5, Int(abs(event.deltaY))))
+        for _ in 0..<count {
+            term.sendResponse(text: "\u{1b}[<\(button);\(col);\(row)M")
+        }
+    }
 }

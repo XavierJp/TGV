@@ -32,13 +32,19 @@ public final class MoshSession: @unchecked Sendable {
             "COLORTERM=truecolor",
             "LANG=en_US.UTF-8",
         ]
-        if let path = ProcessInfo.processInfo.environment["PATH"] {
+        let parent = ProcessInfo.processInfo.environment
+        if let path = parent["PATH"] {
             env.append("PATH=\(path)")
         } else {
             env.append("PATH=/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin")
         }
-        if let home = ProcessInfo.processInfo.environment["HOME"] {
-            env.append("HOME=\(home)")
+        // Pass through the auth/identity vars mosh's inner SSH handshake needs.
+        // Without SSH_AUTH_SOCK the agent can't be reached and pubkey auth fails,
+        // which makes the remote shell die and mosh print "[mosh is exiting.]".
+        for key in ["HOME", "USER", "LOGNAME", "SSH_AUTH_SOCK"] {
+            if let value = parent[key] {
+                env.append("\(key)=\(value)")
+            }
         }
 
         localProcess.startProcess(

@@ -103,11 +103,11 @@ private final class MetricRow: NSView {
         translatesAutoresizingMaskIntoConstraints = false
 
         labelView.stringValue = label
-        labelView.font = NSFont.systemFont(ofSize: 10, weight: .medium)
+        labelView.font = AppFont.medium(12)
         labelView.textColor = .secondaryLabelColor
         labelView.translatesAutoresizingMaskIntoConstraints = false
 
-        valueView.font = NSFont.monospacedSystemFont(ofSize: 9, weight: .regular)
+        valueView.font = AppFont.regular(11)
         valueView.textColor = .tertiaryLabelColor
         valueView.translatesAutoresizingMaskIntoConstraints = false
         valueView.alignment = .right

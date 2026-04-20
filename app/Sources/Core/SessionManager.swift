@@ -110,11 +110,13 @@ public actor SessionManager {
 
     // MARK: - Spawn
 
-    /// Spawn a new session container on the given branch.
-    /// onStep is called with progress messages.
-    public func spawn(branch: String, onStep: @Sendable (String) -> Void = { _ in }) async throws -> String {
+    /// Spawn a new session container on the given branch using a caller-supplied name.
+    /// onStep is called with progress messages. The name must be generated ahead of
+    /// time (via `makeSessionName(repoURL:)`) so the client-side store can show a
+    /// CREATING row before the docker run completes.
+    public func spawn(name: String, branch: String, prompt: String? = nil, onStep: @Sendable (String) -> Void = { _ in }) async throws {
+        guard Self.isShellSafe(name) else { throw SessionError.invalidName(name) }
         guard Self.isShellSafe(branch) else { throw SessionError.invalidBranch(branch) }
-        let name = Self.makeSessionName(repoURL: config.repoURL)
 
         let script = makeEntrypointScript(branch: branch)
         let scriptB64 = Data(script.utf8).base64EncodedString()
@@ -124,15 +126,8 @@ public actor SessionManager {
         _ = try await ssh.exec("mkdir -p /tmp/tgv-scripts && chmod 700 /tmp/tgv-scripts")
         _ = try await ssh.exec("echo '\(scriptB64)' | base64 -d > /tmp/tgv-scripts/\(name).sh && chmod +x /tmp/tgv-scripts/\(name).sh")
 
-        // Step 2: copy OpenRouter API key (non-fatal but logged)
+        // Step 2: GitHub token from local gh CLI (non-fatal but logged)
         onStep("Configuring credentials")
-        do {
-            _ = try await ssh.exec("cp ~/.config/tgv/openrouter_key /tmp/tgv-scripts/\(name).key 2>/dev/null; chmod 644 /tmp/tgv-scripts/\(name).key 2>/dev/null; true")
-        } catch {
-            onStep("Warning: OpenRouter key copy failed — \(error)")
-        }
-
-        // Step 2b: GitHub token from local gh CLI (non-fatal but logged)
         if let token = Self.localGHToken() {
             let tokenB64 = Data(token.utf8).base64EncodedString()
             do {
@@ -149,7 +144,18 @@ public actor SessionManager {
             }
         }
 
-        // Step 3: docker run
+        // Step 3: codex prompt (base64'd if provided, empty file otherwise). The
+        // empty-file fallback keeps the read-only mount valid for sessions spawned
+        // without a prompt — the attach command then just launches codex bare.
+        if let prompt = prompt, !prompt.isEmpty {
+            onStep("Recording prompt")
+            let promptB64 = Data(prompt.utf8).base64EncodedString()
+            _ = try await ssh.exec("echo '\(promptB64)' | base64 -d > /tmp/tgv-scripts/\(name).prompt && chmod 644 /tmp/tgv-scripts/\(name).prompt")
+        } else {
+            _ = try? await ssh.exec("touch /tmp/tgv-scripts/\(name).prompt")
+        }
+
+        // Step 4: docker run
         onStep("Starting container")
         let dockerCmd = """
         docker run -d \
@@ -162,10 +168,10 @@ public actor SessionManager {
         -e COLORTERM=truecolor \
         -e LANG=C.UTF-8 \
         -v tgv-workspace-\(name):/workspace/repo \
-        -v tgv-opencode-\(name):/mnt/opencode \
+        -v tgv-codex-auth:/mnt/codex \
         -v /tmp/tgv-scripts/\(name).sh:/entrypoint.sh:ro \
-        -v /tmp/tgv-scripts/\(name).key:/run/secrets/openrouter_key:ro \
         -v /tmp/tgv-scripts/\(name).gh:/run/secrets/gh_token:ro \
+        -v /tmp/tgv-scripts/\(name).prompt:/run/secrets/codex_prompt:ro \
         \(config.dockerImage) \
         bash /entrypoint.sh
         """
@@ -174,7 +180,6 @@ public actor SessionManager {
         if !result.success {
             throw SessionError.spawnFailed(result.stderr)
         }
-        return name
     }
 
     // MARK: - Stop
@@ -182,8 +187,8 @@ public actor SessionManager {
     public func stop(name: String) async throws {
         guard Self.isShellSafe(name) else { throw SessionError.invalidName(name) }
         _ = try await ssh.exec("docker rm -f \(name)")
-        _ = try await ssh.exec("docker volume rm -f tgv-workspace-\(name) tgv-opencode-\(name)")
-        _ = try await ssh.exec("rm -f /tmp/tgv-scripts/\(name).sh /tmp/tgv-scripts/\(name).key /tmp/tgv-scripts/\(name).gh /tmp/tgv-meta/\(name).name")
+        _ = try await ssh.exec("docker volume rm -f tgv-workspace-\(name)")
+        _ = try await ssh.exec("rm -f /tmp/tgv-scripts/\(name).sh /tmp/tgv-scripts/\(name).gh /tmp/tgv-scripts/\(name).prompt /tmp/tgv-meta/\(name).name")
     }
 
     // MARK: - Rename
@@ -418,11 +423,22 @@ public actor SessionManager {
         _ = try await ssh.exec(cmd)
     }
 
-    /// Push the current branch.
+    /// Push the current branch (with upstream tracking).
     public func gitPush(container: String) async throws {
         guard Self.isShellSafe(container) else { throw SessionError.invalidName(container) }
-        let cmd = "docker exec -u dev -w /workspace/repo \(container) git push 2>&1"
+        let cmd = "docker exec -u dev -w /workspace/repo \(container) bash -c 'branch=$(git rev-parse --abbrev-ref HEAD) && git push -u origin \"$branch\" 2>&1'"
         _ = try await ssh.exec(cmd)
+    }
+
+    /// Create a pull request using gh CLI inside the container.
+    public func gitCreatePR(container: String, title: String) async throws {
+        guard Self.isShellSafe(container) else { throw SessionError.invalidName(container) }
+        let safeTitle = title.replacingOccurrences(of: "'", with: "'\\''")
+        let cmd = "docker exec -u dev -w /workspace/repo \(container) gh pr create --title '\(safeTitle)' --body '' --fill 2>&1"
+        let result = try await ssh.exec(cmd)
+        if !result.success {
+            throw SessionError.sshError("PR creation failed: \(result.stderr.isEmpty ? result.stdout : result.stderr)")
+        }
     }
 
     /// Run `git log` inside a running container and return the raw output.
@@ -435,47 +451,16 @@ public actor SessionManager {
 
     // MARK: - Attach command
 
-    /// Tools (tmux, tree, etc.) are baked into the docker image at `tgv-init` time,
-    /// so this is a no-op for new containers. Kept for backward-compat with old
-    /// containers built before the bake-in: writes a fresh tmux.conf and installs
-    /// tmux on-demand if missing.
-    public func ensureTools(container: String) async throws {
-        guard Self.isShellSafe(container) else { throw SessionError.invalidName(container) }
-
-        let script = #"""
-        set -e
-        # Old containers may not have tmux — best-effort install
-        if ! command -v tmux >/dev/null 2>&1; then
-          apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y tmux
-        fi
-        # Always (re)write tmux config so changes apply
-        mkdir -p /home/dev
-        cat > /home/dev/.tmux.conf << 'TMUXEOF'
-        set -g status off
-        set -g mouse on
-        set -g history-limit 50000
-        set -g default-terminal "xterm-256color"
-        set -ga terminal-overrides ",*256col*:Tc"
-        set -g set-clipboard on
-        bind-key -n C-q detach
-        TMUXEOF
-        chown dev:dev /home/dev/.tmux.conf
-        """#
-
-        let encoded = Data(script.utf8).base64EncodedString()
-        let cmd = "docker exec -u root \(container) bash -c 'echo \(encoded) | base64 -d | bash'"
-        let result = try await ssh.exec(cmd)
-        if !result.success {
-            throw SessionError.sshError("ensureTools failed: \(result.stderr.isEmpty ? result.stdout : result.stderr)")
-        }
-    }
-
     /// Build the docker exec command to attach to a session's tmux.
     /// `new-session -A` creates the session if it doesn't exist, else attaches.
-    /// tmux is baked into the docker image at `tgv-init` time.
+    /// On first creation, tmux runs `/usr/local/bin/tgv-codex`, a wrapper
+    /// installed by the entrypoint that reads the mounted prompt file and
+    /// passes it to codex (or runs codex bare when the prompt is empty).
+    /// The wrapper keeps the attach command a flat list of words — mosh splits
+    /// on whitespace, so embedding shell quoting here would break it.
     public nonisolated func attachCommand(container: String) -> String {
         precondition(Self.isShellSafe(container), "unsafe container name")
-        return "docker exec -u dev -it -w /workspace/repo \(container) tmux new-session -A -s tgv opencode"
+        return "docker exec -u dev -it -w /workspace/repo \(container) tmux new-session -A -s tgv /usr/local/bin/tgv-codex"
     }
 
     // MARK: - Helpers
@@ -487,7 +472,7 @@ public actor SessionManager {
     }
 
     /// Generate a session name like "myrepo-3f8a9b21"
-    static func makeSessionName(repoURL: String) -> String {
+    public static func makeSessionName(repoURL: String) -> String {
         let cleaned = repoURL.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
         let last = cleaned.split(separator: "/").last.map(String.init) ?? "session"
         let repo = last.hasSuffix(".git") ? String(last.dropLast(4)) : last
@@ -500,6 +485,37 @@ public actor SessionManager {
         let suffix = String(hash.prefix(8))
 
         return "\(repo)-\(suffix)"
+    }
+
+    /// Slugify a user-supplied title into a git-safe branch name like
+    /// "tgv/add-dark-mode-a3b2". Falls back to a random name if the title has
+    /// no usable alphanumerics.
+    public static func branchFromTitle(_ title: String) -> String {
+        let lower = title.lowercased()
+        var out: [Character] = []
+        var lastDash = true
+        for ch in lower {
+            if (ch >= "a" && ch <= "z") || (ch >= "0" && ch <= "9") {
+                out.append(ch)
+                lastDash = false
+            } else if !lastDash {
+                out.append("-")
+                lastDash = true
+            }
+        }
+        while out.last == "-" { out.removeLast() }
+        var slug = String(out)
+        if slug.count > 40 { slug = String(slug.prefix(40)) }
+        while slug.hasSuffix("-") { slug.removeLast() }
+        if slug.isEmpty { return randomBranchName() }
+
+        let now = UInt64(Date().timeIntervalSince1970 * 1_000_000_000)
+        var hasher = Hasher()
+        hasher.combine(now)
+        hasher.combine(title)
+        let h = UInt64(bitPattern: Int64(hasher.finalize()))
+        let hex = String(h & 0xFFFF, radix: 16)
+        return "tgv/\(slug)-\(hex)"
     }
 
     /// Generate a random branch name like "tgv/swift-river-3a8"
@@ -552,31 +568,6 @@ public actor SessionManager {
         #!/bin/bash
         # Entrypoint runs as root — copies secrets, writes config, then drops to dev
 
-        if [ -f /run/secrets/openrouter_key ]; then
-          export OPENROUTER_API_KEY=$(cat /run/secrets/openrouter_key)
-        fi
-
-        cat > /workspace/repo/opencode.json << 'CFGEOF'
-        {
-          "$schema": "https://opencode.ai/config.json",
-          "provider": {
-            "openrouter": {
-              "models": {
-                "qwen/qwen3-coder": {},
-                "qwen/qwen3-coder:free": {}
-              }
-            }
-          }
-        }
-        CFGEOF
-
-        cat > /workspace/repo/tui.json << 'CFGEOF'
-        {
-          "$schema": "https://opencode.ai/tui.json",
-          "theme": "tokyonight"
-        }
-        CFGEOF
-
         if [ -f /run/secrets/gh_token ] && [ -s /run/secrets/gh_token ]; then
           GH_TOKEN=$(cat /run/secrets/gh_token)
           mkdir -p /home/dev/.config/gh
@@ -604,11 +595,61 @@ public actor SessionManager {
           git checkout -b \#(branch) 2>/dev/null
         fi
 
-        chown -R dev:dev /mnt/opencode
-        mkdir -p /home/dev/.local/share
-        ln -sfn /mnt/opencode /home/dev/.local/share/opencode
+        # Persist Codex config + auth across container restarts via the shared
+        # tgv-codex-auth volume mounted at /mnt/codex. On first boot, seed it
+        # with the image's ~/.codex baseline (AGENTS.md etc. from `rtk init`),
+        # then replace the real ~/.codex with a symlink so codex writes auth
+        # tokens into the persistent volume instead of the ephemeral container.
+        if [ -z "$(ls -A /mnt/codex 2>/dev/null)" ] && [ -d /home/dev/.codex ]; then
+          cp -a /home/dev/.codex/. /mnt/codex/
+        fi
+        chown -R dev:dev /mnt/codex
+        rm -rf /home/dev/.codex
+        ln -s /mnt/codex /home/dev/.codex
+        chown -h dev:dev /home/dev/.codex
+
+        # Default codex to full-auto mode
+        if [ ! -f /mnt/codex/config.json ]; then
+          cat > /mnt/codex/config.json << 'CODEXEOF'
+        {"approval_mode":"full-auto"}
+        CODEXEOF
+          chown dev:dev /mnt/codex/config.json
+        fi
+
+        # Install /usr/local/bin/tgv-codex — wrapper that reads the mounted
+        # prompt file and forwards it to codex. Keeps the client-side attach
+        # command a flat argv list (mosh splits args on whitespace, so any
+        # shell quoting here would get mangled on the way to the remote host).
+        cat > /usr/local/bin/tgv-codex << 'TGVCODEXEOF'
+        #!/bin/bash
+        p=""
+        if [ -r /run/secrets/codex_prompt ]; then
+          p=$(cat /run/secrets/codex_prompt 2>/dev/null)
+        fi
+        if [ -n "$p" ]; then
+          exec codex "$p"
+        else
+          exec codex
+        fi
+        TGVCODEXEOF
+        chmod +x /usr/local/bin/tgv-codex
+
+        # tmux config — mouse on so tmux handles scroll wheel; the native
+        # terminal disables mouse reporting client-side so click+drag selection
+        # and Cmd+C still work locally.
+        mkdir -p /home/dev
+        cat > /home/dev/.tmux.conf << 'TMUXEOF'
+        set -g status off
+        set -g mouse on
+        set -g history-limit 50000
+        set -g default-terminal "xterm-256color"
+        set -ga terminal-overrides ",*256col*:Tc"
+        set -g set-clipboard on
+        bind-key -n C-q detach
+        TMUXEOF
+
         chown -R dev:dev /home/dev /workspace/repo
-        exec su dev -c 'export OPENROUTER_API_KEY=$(cat /run/secrets/openrouter_key 2>/dev/null); sleep infinity'
+        exec su dev -c 'sleep infinity'
         """#
     }
 }

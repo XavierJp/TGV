@@ -1,16 +1,15 @@
 import AppKit
+import Combine
 import Core
 
 /// Native git status view that replaces the terminal-based `watch git status`.
-/// Shows branch info, staged changes, unstaged changes, and untracked files
-/// with colors and SF Symbol icons. Auto-refreshed by TGVApp.
+/// Binds to a `SessionState` and renders its cached git data reactively.
 final class GitStatusView: NSView {
     /// Called when the user clicks a changed file. Path is relative to repo root.
     var onFileClicked: ((String) -> Void)?
-    /// Called when the user clicks Commit. Passes the commit message.
-    var onCommit: ((String) -> Void)?
-    /// Called when the user clicks Push.
-    var onPush: (() -> Void)?
+    /// Called when the user clicks "Commit & Push". Passes the commit message.
+    /// The handler should commit, push, and create a PR.
+    var onCommitAndPush: ((String) -> Void)?
 
     private let scrollView = NSScrollView()
     private let stack = NSStackView()
@@ -20,13 +19,17 @@ final class GitStatusView: NSView {
     private let branchIcon = NSImageView()
     private let branchNameLabel = NSTextField(labelWithString: "")
     private let branchMetaLabel = NSTextField(labelWithString: "")
+    private let staleLabel = NSTextField(labelWithString: "")
     private let branchContainer = NSView()
+
+    private var cancellables = Set<AnyCancellable>()
+    private weak var boundState: SessionState?
+    private var staleTimer: Timer?
 
     // Commit area
     private let commitScroll = NSScrollView()
     private let commitTextView = NSTextView()
-    private let commitButton = NSButton(title: "Commit", target: nil, action: nil)
-    private let pushButton = NSButton(title: "Push", target: nil, action: nil)
+    private let commitButton = NSButton(title: "Commit & Push", target: nil, action: nil)
     private let commitContainer = NSView()
 
     override init(frame: NSRect) {
@@ -41,7 +44,7 @@ final class GitStatusView: NSView {
 
     private func setup() {
         wantsLayer = true
-        layer?.backgroundColor = NSColor.windowBackgroundColor.cgColor
+        layer?.backgroundColor = NSColor(srgbRed: 0x1a/255, green: 0x1b/255, blue: 0x26/255, alpha: 1).cgColor
 
         // 1. Branch header (fixed at top)
         branchContainer.translatesAutoresizingMaskIntoConstraints = false
@@ -50,16 +53,22 @@ final class GitStatusView: NSView {
             branchIcon.contentTintColor = .systemGreen
         }
         branchIcon.translatesAutoresizingMaskIntoConstraints = false
-        branchNameLabel.font = NSFont.systemFont(ofSize: 13, weight: .semibold)
+        branchNameLabel.font = AppFont.semibold(13)
         branchNameLabel.textColor = .labelColor
         branchNameLabel.translatesAutoresizingMaskIntoConstraints = false
-        branchMetaLabel.font = NSFont.monospacedSystemFont(ofSize: 11, weight: .regular)
+        branchMetaLabel.font = AppFont.regular(11)
         branchMetaLabel.textColor = .secondaryLabelColor
         branchMetaLabel.translatesAutoresizingMaskIntoConstraints = false
+
+        staleLabel.font = AppFont.medium(10)
+        staleLabel.textColor = .systemOrange
+        staleLabel.translatesAutoresizingMaskIntoConstraints = false
+        staleLabel.isHidden = true
 
         branchContainer.addSubview(branchIcon)
         branchContainer.addSubview(branchNameLabel)
         branchContainer.addSubview(branchMetaLabel)
+        branchContainer.addSubview(staleLabel)
 
         let branchDivider = NSBox()
         branchDivider.boxType = .separator
@@ -68,7 +77,7 @@ final class GitStatusView: NSView {
         // 2. Commit area — multi-line text view + buttons
         commitContainer.translatesAutoresizingMaskIntoConstraints = false
 
-        commitTextView.font = NSFont.systemFont(ofSize: 12)
+        commitTextView.font = AppFont.regular(12)
         commitTextView.isRichText = false
         commitTextView.isAutomaticQuoteSubstitutionEnabled = false
         commitTextView.isAutomaticDashSubstitutionEnabled = false
@@ -80,22 +89,14 @@ final class GitStatusView: NSView {
         commitScroll.translatesAutoresizingMaskIntoConstraints = false
 
         commitButton.bezelStyle = .rounded
-        commitButton.font = NSFont.systemFont(ofSize: 11, weight: .medium)
+        commitButton.font = AppFont.medium(11)
         commitButton.target = self
         commitButton.action = #selector(commitTapped)
         commitButton.translatesAutoresizingMaskIntoConstraints = false
         commitButton.controlSize = .small
 
-        pushButton.bezelStyle = .rounded
-        pushButton.font = NSFont.systemFont(ofSize: 11, weight: .medium)
-        pushButton.target = self
-        pushButton.action = #selector(pushTapped)
-        pushButton.translatesAutoresizingMaskIntoConstraints = false
-        pushButton.controlSize = .small
-
         commitContainer.addSubview(commitScroll)
         commitContainer.addSubview(commitButton)
-        commitContainer.addSubview(pushButton)
 
         let commitDivider = NSBox()
         commitDivider.boxType = .separator
@@ -138,6 +139,9 @@ final class GitStatusView: NSView {
             branchMetaLabel.leadingAnchor.constraint(equalTo: branchNameLabel.trailingAnchor, constant: 6),
             branchMetaLabel.centerYAnchor.constraint(equalTo: branchContainer.centerYAnchor),
 
+            staleLabel.trailingAnchor.constraint(equalTo: branchContainer.trailingAnchor, constant: -14),
+            staleLabel.centerYAnchor.constraint(equalTo: branchContainer.centerYAnchor),
+
             branchDivider.topAnchor.constraint(equalTo: branchContainer.bottomAnchor),
             branchDivider.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 14),
             branchDivider.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -14),
@@ -154,9 +158,6 @@ final class GitStatusView: NSView {
             commitButton.topAnchor.constraint(equalTo: commitScroll.bottomAnchor, constant: 6),
             commitButton.leadingAnchor.constraint(equalTo: commitContainer.leadingAnchor, constant: 14),
             commitButton.bottomAnchor.constraint(equalTo: commitContainer.bottomAnchor, constant: -8),
-            pushButton.topAnchor.constraint(equalTo: commitScroll.bottomAnchor, constant: 6),
-            pushButton.leadingAnchor.constraint(equalTo: commitButton.trailingAnchor, constant: 6),
-            pushButton.bottomAnchor.constraint(equalTo: commitContainer.bottomAnchor, constant: -8),
 
             commitDivider.topAnchor.constraint(equalTo: commitContainer.bottomAnchor),
             commitDivider.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 14),
@@ -189,16 +190,77 @@ final class GitStatusView: NSView {
     @objc private func commitTapped() {
         let msg = commitTextView.string.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !msg.isEmpty else { return }
-        onCommit?(msg)
+        onCommitAndPush?(msg)
         commitTextView.string = ""
-    }
-
-    @objc private func pushTapped() {
-        onPush?()
     }
 
     /// Cached commits — updated separately from status so we don't rebuild the whole view.
     private var currentCommits: [GitStatus.Commit] = []
+
+    func bind(state: SessionState?) {
+        cancellables.removeAll()
+        staleTimer?.invalidate(); staleTimer = nil
+        boundState = state
+
+        guard let state = state else {
+            clearAll()
+            return
+        }
+
+        // Render whatever the state has already cached so view switches are instant.
+        if let cached = state.gitStatus {
+            updateAll(status: cached, commits: state.commits)
+        } else {
+            clearAll()
+        }
+        updateStaleIndicator()
+
+        // Sink on status + commits: Combine emits the current values on subscribe,
+        // then on every publish thereafter.
+        Publishers.CombineLatest(state.$gitStatus, state.$commits)
+            .receive(on: RunLoop.main)
+            .sink { [weak self] status, commits in
+                guard let self = self else { return }
+                if let status = status {
+                    self.updateAll(status: status, commits: commits)
+                } else {
+                    self.clearAll()
+                }
+            }
+            .store(in: &cancellables)
+
+        state.$gitRefreshedAt
+            .receive(on: RunLoop.main)
+            .sink { [weak self] _ in self?.updateStaleIndicator() }
+            .store(in: &cancellables)
+
+        // Local timer recomputes the stale indicator once per second so it appears
+        // even while no new data is arriving.
+        staleTimer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
+            self?.updateStaleIndicator()
+        }
+    }
+
+    private func clearAll() {
+        currentCommits = []
+        branchNameLabel.stringValue = ""
+        branchMetaLabel.stringValue = ""
+        for v in stack.arrangedSubviews {
+            stack.removeArrangedSubview(v)
+            v.removeFromSuperview()
+        }
+    }
+
+    private func updateStaleIndicator() {
+        guard let state = boundState, state.gitRefreshedAt != nil else {
+            staleLabel.isHidden = true
+            return
+        }
+        staleLabel.isHidden = !state.isGitStale
+        if state.isGitStale {
+            staleLabel.stringValue = "⟳ stale"
+        }
+    }
 
     func update(_ status: GitStatus) {
         rebuild(status: status, commits: currentCommits)
@@ -240,7 +302,7 @@ final class GitStatusView: NSView {
             addSection(title: "Untracked", count: status.untracked.count, entries: status.untracked, color: .tertiaryLabelColor)
         }
         if status.isEmpty {
-            let clean = makeLabel("  Nothing to commit, working tree clean", font: .systemFont(ofSize: 12), color: .secondaryLabelColor)
+            let clean = makeLabel("  Nothing to commit, working tree clean", font: AppFont.regular(12), color: .secondaryLabelColor)
             clean.translatesAutoresizingMaskIntoConstraints = false
             let row = wrapRow(clean)
             row.translatesAutoresizingMaskIntoConstraints = false
@@ -258,7 +320,7 @@ final class GitStatusView: NSView {
             stack.removeArrangedSubview(v)
             v.removeFromSuperview()
         }
-        let label = makeLabel("  \(message)", font: .systemFont(ofSize: 12), color: .systemRed)
+        let label = makeLabel("  \(message)", font: AppFont.regular(12), color: .systemRed)
         label.translatesAutoresizingMaskIntoConstraints = false
         let row = wrapRow(label)
         row.translatesAutoresizingMaskIntoConstraints = false
@@ -271,7 +333,7 @@ final class GitStatusView: NSView {
 
     private func addSection(title: String, count: Int, entries: [GitStatus.Entry], color: NSColor) {
         // Section header
-        let header = makeLabel("  \(title) (\(count))", font: .systemFont(ofSize: 10, weight: .semibold), color: .tertiaryLabelColor)
+        let header = makeLabel("  \(title) (\(count))", font: AppFont.semibold(10), color: .tertiaryLabelColor)
         header.translatesAutoresizingMaskIntoConstraints = false
         let headerRow = NSView()
         headerRow.translatesAutoresizingMaskIntoConstraints = false
@@ -301,19 +363,19 @@ final class GitStatusView: NSView {
         }
         row.translatesAutoresizingMaskIntoConstraints = false
 
-        let badge = makeLabel(statusChar(entry.status), font: .monospacedSystemFont(ofSize: 11, weight: .bold), color: color)
+        let badge = makeLabel(statusChar(entry.status), font: AppFont.bold(11), color: color)
         badge.translatesAutoresizingMaskIntoConstraints = false
 
         // Show just the filename (last path component) with the full path as a tooltip
         let filename = (entry.path as NSString).lastPathComponent
-        let pathLabel = makeLabel(filename, font: .monospacedSystemFont(ofSize: 12, weight: .regular), color: .labelColor)
+        let pathLabel = makeLabel(filename, font: AppFont.regular(12), color: .labelColor)
         pathLabel.translatesAutoresizingMaskIntoConstraints = false
         pathLabel.toolTip = entry.path
         pathLabel.lineBreakMode = .byTruncatingMiddle
 
         // Directory hint (dimmed prefix)
         let dir = (entry.path as NSString).deletingLastPathComponent
-        let dirLabel = makeLabel(dir.isEmpty ? "" : "\(dir)/", font: .monospacedSystemFont(ofSize: 10, weight: .regular), color: .tertiaryLabelColor)
+        let dirLabel = makeLabel(dir.isEmpty ? "" : "\(dir)/", font: AppFont.regular(10), color: .tertiaryLabelColor)
         dirLabel.translatesAutoresizingMaskIntoConstraints = false
         dirLabel.lineBreakMode = .byTruncatingHead
 
@@ -371,7 +433,7 @@ final class GitStatusView: NSView {
         div.heightAnchor.constraint(equalToConstant: 1).isActive = true
 
         // Header
-        let header = makeLabel("  COMMITS (\(commits.count))", font: .systemFont(ofSize: 10, weight: .semibold), color: .tertiaryLabelColor)
+        let header = makeLabel("  COMMITS (\(commits.count))", font: AppFont.semibold(10), color: .tertiaryLabelColor)
         header.translatesAutoresizingMaskIntoConstraints = false
         let headerRow = NSView()
         headerRow.translatesAutoresizingMaskIntoConstraints = false
@@ -399,10 +461,10 @@ final class GitStatusView: NSView {
         let row = NSView()
         row.translatesAutoresizingMaskIntoConstraints = false
 
-        let hash = makeLabel(commit.hash, font: .monospacedSystemFont(ofSize: 10, weight: .regular), color: .systemYellow)
+        let hash = makeLabel(commit.hash, font: AppFont.regular(10), color: .systemYellow)
         hash.translatesAutoresizingMaskIntoConstraints = false
 
-        let msg = makeLabel(commit.message, font: .systemFont(ofSize: 11), color: .labelColor)
+        let msg = makeLabel(commit.message, font: AppFont.regular(11), color: .labelColor)
         msg.translatesAutoresizingMaskIntoConstraints = false
         msg.lineBreakMode = .byWordWrapping
         msg.maximumNumberOfLines = 2

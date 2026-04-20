@@ -1,15 +1,20 @@
 import AppKit
+import Combine
 import Core
 
 /// Native file tree view using NSOutlineView.
-/// Renders the repo's file structure with expandable/collapsible folders.
+/// Binds to a `SessionState` and renders its cached file tree reactively.
 final class FileTreeView: NSView, NSOutlineViewDataSource, NSOutlineViewDelegate {
     /// Called when the user clicks a file (not a directory). Path is relative to repo root.
     var onFileClicked: ((String) -> Void)?
+    /// Latest flat list of paths — exposed for the fuzzy finder.
+    private(set) var currentFilePaths: [String] = []
 
     private let scrollView = NSScrollView()
     private let outlineView = NSOutlineView()
     private var rootNodes: [FileNode] = []
+
+    private var cancellables = Set<AnyCancellable>()
 
     override init(frame: NSRect) {
         super.init(frame: frame)
@@ -23,13 +28,14 @@ final class FileTreeView: NSView, NSOutlineViewDataSource, NSOutlineViewDelegate
 
     private func setup() {
         wantsLayer = true
-        layer?.backgroundColor = NSColor.windowBackgroundColor.cgColor
+        let darkBlue = NSColor(srgbRed: 0x1a/255, green: 0x1b/255, blue: 0x26/255, alpha: 1)
+        layer?.backgroundColor = darkBlue.cgColor
 
         outlineView.headerView = nil
         outlineView.rowHeight = 22
         outlineView.indentationPerLevel = 16
         outlineView.style = .plain
-        outlineView.backgroundColor = .windowBackgroundColor
+        outlineView.backgroundColor = darkBlue
         outlineView.dataSource = self
         outlineView.delegate = self
         outlineView.target = self
@@ -52,6 +58,27 @@ final class FileTreeView: NSView, NSOutlineViewDataSource, NSOutlineViewDelegate
             scrollView.trailingAnchor.constraint(equalTo: trailingAnchor),
             scrollView.bottomAnchor.constraint(equalTo: bottomAnchor),
         ])
+    }
+
+    func bind(state: SessionState?) {
+        cancellables.removeAll()
+        guard let state = state else {
+            currentFilePaths = []
+            update([])
+            return
+        }
+
+        // Immediate snapshot so view switches show cached data without flicker.
+        currentFilePaths = state.filePaths
+        update(state.fileTree)
+
+        Publishers.CombineLatest(state.$fileTree, state.$filePaths)
+            .receive(on: RunLoop.main)
+            .sink { [weak self] tree, paths in
+                self?.currentFilePaths = paths
+                self?.update(tree)
+            }
+            .store(in: &cancellables)
     }
 
     /// Replace the entire tree. Preserves expansion state for matching paths.
@@ -127,7 +154,7 @@ final class FileTreeView: NSView, NSOutlineViewDataSource, NSOutlineViewDelegate
 
             let textField = NSTextField(labelWithString: "")
             textField.translatesAutoresizingMaskIntoConstraints = false
-            textField.font = NSFont.monospacedSystemFont(ofSize: 12, weight: .regular)
+            textField.font = AppFont.regular(12)
             textField.lineBreakMode = .byTruncatingMiddle
             cell.addSubview(textField)
             cell.textField = textField

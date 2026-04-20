@@ -5,6 +5,7 @@ ENV DEBIAN_FRONTEND=noninteractive
 # Base tools — everything baked in so containers start fast
 RUN apt-get update && apt-get install -y --no-install-recommends \
     git \
+    git-delta \
     build-essential \
     python3 \
     curl \
@@ -22,6 +23,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     locales \
     sudo \
     ncurses-term \
+    bubblewrap \
     && locale-gen en_US.UTF-8 \
     && rm -rf /var/lib/apt/lists/*
 
@@ -44,14 +46,42 @@ RUN curl -LsSf https://astral.sh/uv/install.sh | sh \
     && cp -L /root/.local/bin/uv /usr/local/bin/uv \
     && chmod 755 /usr/local/bin/uv
 
-# OpenCode
-RUN curl -fsSL https://raw.githubusercontent.com/anomalyco/opencode/refs/heads/dev/install | bash \
-    && cp -L /root/.opencode/bin/opencode /usr/local/bin/opencode \
-    && chmod 755 /usr/local/bin/opencode
+# OpenAI Codex CLI
+RUN npm install -g @openai/codex
 
-# tgv-diff: open codediff.nvim for a file against HEAD
-RUN printf '#!/bin/sh\nnvim -c "CodeDiff" -- "$1"\n' > /usr/local/bin/tgv-diff && \
-    chmod 755 /usr/local/bin/tgv-diff
+# rtk (Rust Token Killer)
+RUN curl -fsSL https://raw.githubusercontent.com/rtk-ai/rtk/refs/heads/master/install.sh | sh \
+    && cp -L /root/.local/bin/rtk /usr/local/bin/rtk \
+    && chmod 755 /usr/local/bin/rtk
+
+# System-wide git config: use delta as the pager for diff/log/show.
+RUN cat > /etc/gitconfig << 'GITEOF'
+[core]
+    pager = delta
+[interactive]
+    diffFilter = delta --color-only
+[delta]
+    navigate = true
+    line-numbers = true
+    hyperlinks = false
+[merge]
+    conflictstyle = zdiff3
+GITEOF
+
+# tgv-diff: open nvim in diff mode against the HEAD version of the file.
+# nvim blocks until the user quits, so mosh keeps the session alive
+# (unlike a pager pipeline which auto-exits on short diffs).
+RUN cat > /usr/local/bin/tgv-diff << 'DIFFEOF' && chmod 755 /usr/local/bin/tgv-diff
+#!/bin/sh
+cd /workspace/repo
+head_copy=$(mktemp)
+trap 'rm -f "$head_copy"' EXIT
+if git show "HEAD:$1" > "$head_copy" 2>/dev/null; then
+    nvim -d -R "$head_copy" "$1"
+else
+    nvim "$1"
+fi
+DIFFEOF
 
 # Non-root dev user with sudo
 RUN useradd -m -s /bin/zsh -G sudo dev && \
@@ -63,6 +93,9 @@ ENV HOME=/home/dev
 RUN sh -c "$(curl -fsSL https://raw.githubusercontent.com/ohmyzsh/ohmyzsh/master/tools/install.sh)" "" --unattended && \
     git clone --depth=1 https://github.com/zsh-users/zsh-autosuggestions ${ZSH_CUSTOM:-$HOME/.oh-my-zsh/custom}/plugins/zsh-autosuggestions && \
     git clone --depth=1 https://github.com/zsh-users/zsh-syntax-highlighting ${ZSH_CUSTOM:-$HOME/.oh-my-zsh/custom}/plugins/zsh-syntax-highlighting
+
+# rtk integration with Codex (writes AGENTS.md + RTK.md into ~/.codex)
+RUN rtk init -g --codex
 
 # Minimal zsh theme: branch ❯
 RUN cat > /home/dev/.oh-my-zsh/custom/themes/tgv.zsh-theme << 'THEMEEOF'
@@ -94,6 +127,8 @@ command -v fdfind &>/dev/null && alias fd='fdfind'
 ZSHEOF
 
 # tmux config — used by `tmux new-session -A -s tgv` from the TGV app
+# mouse on: tmux handles scroll wheel for scrollback. Selection/copy is
+# handled client-side by TGV (allowMouseReporting=false on TerminalView).
 RUN cat > /home/dev/.tmux.conf << 'TMUXEOF'
 set -g status off
 set -g mouse on
@@ -188,11 +223,6 @@ require("lazy").setup({
         lualine_x = { "%l:%c" },
       },
     },
-  },
-  {
-    "esmuellert/codediff.nvim",
-    cmd = { "CodeDiff" },
-    opts = {},
   },
 }, {
   lockfile = vim.fn.stdpath("data") .. "/lazy-lock.json",

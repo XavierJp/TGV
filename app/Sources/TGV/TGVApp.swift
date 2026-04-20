@@ -1,15 +1,24 @@
 import AppKit
+import Combine
 import Core
 import SwiftTerm
 
+/// A file or diff tab in the main column — one terminal per open file.
+private struct FileTab {
+    let id: String                 // "file:<path>" or "diff:<path>"
+    let label: String              // filename shown in the tab
+    let terminal: TerminalTabView
+}
+
 /// Terminals attached to a session container.
 private struct SessionPanes {
-    let main: TerminalTabView      // tmux + opencode (center area, "Agent" tab)
+    let main: TerminalTabView      // tmux + codex (center area, "Agent" tab)
     let shell: TerminalTabView     // zsh in /workspace/repo (side: Terminal tab)
-    var edit: TerminalTabView?     // nvim or delta diff (center, "Edit" tab)
+    var fileTabs: [FileTab] = []   // user-opened file/diff tabs in the center
+    var activeTabID: String = "agent"
 
     var all: [TerminalTabView] {
-        [main, shell] + (edit.map { [$0] } ?? [])
+        [main, shell] + fileTabs.map { $0.terminal }
     }
 }
 
@@ -24,26 +33,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var mainContainer: NSView!
     private var emptyStateSplash: SplashView?
     private var sidePanel: SidePanelView!
-    private var split: NSSplitView!
+    private var splitVC: NSSplitViewController!
+    private var sidePanelItem: NSSplitViewItem!
     private var centerColumn: NSView!
     private var sidePanelVisible = false
 
     private var config: TGVConfig?
     private var ssh: SSHManager?
     private var sessionManager: SessionManager?
+    private var store: SessionStore?
+    private var storeCancellables = Set<AnyCancellable>()
+    private var activeStateCancellables = Set<AnyCancellable>()
 
-    private var panes: [String: SessionPanes] = [:]   // session.name -> pair
-    private var activeSession: String?
-    private var currentFilePaths: [String] = []       // flat file list for fuzzy finder
+    private var panes: [String: SessionPanes] = [:]
     private var fuzzyFinder: FuzzyFinderPanel?
 
-    private var refreshTimer: Timer?
     private var metricsTimer: Timer?
-    private var gitStatusTimer: Timer?
+    private var reconnectTimer: Timer?
     private var newSessionSheet: NewSessionSheet?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.appearance = NSAppearance(named: .darkAqua)
+        NSApp.applicationIconImage = TrainIcon.makeAppIcon()
+        setupMainMenu()
         setupMenuBar()
         setupWindow()
         installScrollWheelMonitor()
@@ -51,53 +63,57 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         Task { await bootstrap() }
     }
 
-    func applicationWillTerminate(_ notification: Notification) {
-        refreshTimer?.invalidate()
-        metricsTimer?.invalidate()
-        gitStatusTimer?.invalidate()
+    /// Build the app's main menu bar. An Edit menu with standard Copy / Paste /
+    /// Select All items is required so Cmd+C / Cmd+V / Cmd+A route through the
+    /// responder chain to the first responder (the terminal view).
+    private func setupMainMenu() {
+        let mainMenu = NSMenu()
+
+        let appMenuItem = NSMenuItem()
+        mainMenu.addItem(appMenuItem)
+        let appMenu = NSMenu(title: "TGV")
+        appMenu.addItem(withTitle: "About TGV", action: #selector(NSApplication.orderFrontStandardAboutPanel(_:)), keyEquivalent: "")
+        appMenu.addItem(NSMenuItem.separator())
+        appMenu.addItem(withTitle: "Hide TGV", action: #selector(NSApplication.hide(_:)), keyEquivalent: "h")
+        let hideOthers = NSMenuItem(title: "Hide Others", action: #selector(NSApplication.hideOtherApplications(_:)), keyEquivalent: "h")
+        hideOthers.keyEquivalentModifierMask = [.command, .option]
+        appMenu.addItem(hideOthers)
+        appMenu.addItem(withTitle: "Show All", action: #selector(NSApplication.unhideAllApplications(_:)), keyEquivalent: "")
+        appMenu.addItem(NSMenuItem.separator())
+        appMenu.addItem(withTitle: "Quit TGV", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
+        appMenuItem.submenu = appMenu
+
+        let editMenuItem = NSMenuItem()
+        mainMenu.addItem(editMenuItem)
+        let editMenu = NSMenu(title: "Edit")
+        editMenu.addItem(withTitle: "Cut", action: #selector(NSText.cut(_:)), keyEquivalent: "x")
+        editMenu.addItem(withTitle: "Copy", action: #selector(NSText.copy(_:)), keyEquivalent: "c")
+        editMenu.addItem(withTitle: "Paste", action: #selector(NSText.paste(_:)), keyEquivalent: "v")
+        editMenu.addItem(NSMenuItem.separator())
+        editMenu.addItem(withTitle: "Select All", action: #selector(NSResponder.selectAll(_:)), keyEquivalent: "a")
+        editMenuItem.submenu = editMenu
+
+        let windowMenuItem = NSMenuItem()
+        mainMenu.addItem(windowMenuItem)
+        let windowMenu = NSMenu(title: "Window")
+        windowMenu.addItem(withTitle: "Minimize", action: #selector(NSWindow.performMiniaturize(_:)), keyEquivalent: "m")
+        windowMenu.addItem(withTitle: "Zoom", action: #selector(NSWindow.performZoom(_:)), keyEquivalent: "")
+        windowMenu.addItem(NSMenuItem.separator())
+        windowMenu.addItem(withTitle: "Bring All to Front", action: #selector(NSApplication.arrangeInFront(_:)), keyEquivalent: "")
+        windowMenuItem.submenu = windowMenu
+        NSApp.windowsMenu = windowMenu
+
+        NSApp.mainMenu = mainMenu
     }
 
-    /// Global scroll-wheel interceptor.
-    /// SwiftTerm's scrollWheel always scrolls its own buffer — it never forwards
-    /// wheel events to the application (tmux). This monitor intercepts scroll events
-    /// on any TerminalView with mouseMode on, sends SGR mouse sequences, and
-    /// consumes the event so SwiftTerm doesn't fight tmux for the scroll.
+    func applicationWillTerminate(_ notification: Notification) {
+        metricsTimer?.invalidate()
+        reconnectTimer?.invalidate()
+        store?.stop()
+    }
+
     private func installScrollWheelMonitor() {
-        NSEvent.addLocalMonitorForEvents(matching: .scrollWheel) { (event: NSEvent) -> NSEvent? in
-            guard event.deltaY != 0 else { return event }
-
-            // Walk up from the hit view to find a TerminalView
-            var candidate = event.window?.contentView?.hitTest(event.locationInWindow)
-            var termView: TerminalView?
-            while let v = candidate {
-                if let tv = v as? TerminalView { termView = tv; break }
-                candidate = v.superview
-            }
-            guard let tv = termView else { return event }
-
-            // Always send SGR mouse wheel events to the terminal.
-            // We skip the mouseMode check because mosh doesn't forward mouse
-            // mode enable sequences (\e[?1000h) — SwiftTerm never sees them,
-            // so mouseMode stays .off even though tmux has `mouse on`.
-            // Since all our terminals run tmux with mouse on, this is safe.
-            let term = tv.getTerminal()
-            let point = tv.convert(event.locationInWindow, from: nil)
-            let cols = max(1, term.cols)
-            let rows = max(1, term.rows)
-            let cellW = tv.bounds.width / CGFloat(cols)
-            let cellH = tv.bounds.height / CGFloat(rows)
-            let col = max(1, min(cols, Int(point.x / cellW) + 1))
-            let row = max(1, min(rows, Int((tv.bounds.height - point.y) / cellH) + 1))
-
-            // SGR mouse encoding: button 64 = wheel up, 65 = wheel down
-            let button = event.deltaY > 0 ? 64 : 65
-            let count = max(1, min(5, Int(abs(event.deltaY))))
-            for _ in 0..<count {
-                term.sendResponse(text: "\u{1b}[<\(button);\(col);\(row)M")
-            }
-
-            return nil  // consume — don't let SwiftTerm scroll its own buffer
-        }
+        // no-op — kept for symmetry with installCmdPMonitor
     }
 
     /// Intercept Cmd+P to show the native fuzzy file finder.
@@ -105,21 +121,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
             guard event.modifierFlags.contains(.command),
                   event.charactersIgnoringModifiers == "p" else { return event }
-            guard let self = self, self.activeSession != nil else { return event }
+            guard let self = self, self.store?.activeSessionName != nil else { return event }
             self.showFuzzyFinder()
-            return nil  // consume the event
+            return nil
         }
     }
 
     private func showFuzzyFinder() {
-        // Dismiss if already showing
         if let existing = fuzzyFinder {
             existing.dismiss()
             fuzzyFinder = nil
             return
         }
 
-        let panel = FuzzyFinderPanel(files: currentFilePaths, relativeTo: window)
+        let files = store?.activeSession?.filePaths ?? []
+        let panel = FuzzyFinderPanel(files: files, relativeTo: window)
         panel.onSelect = { [weak self] path in
             self?.fuzzyFinder = nil
             self?.openFileTab(path: path)
@@ -142,14 +158,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func setupWindow() {
-        let style: NSWindow.StyleMask = [.titled, .closable, .miniaturizable, .resizable]
+        let style: NSWindow.StyleMask = [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView]
         window = NSWindow(
             contentRect: NSRect(x: 0, y: 0, width: 1300, height: 800),
             styleMask: style,
             backing: .buffered,
             defer: false
         )
+        window.titlebarAppearsTransparent = true
+        window.titleVisibility = .hidden
         window.title = "TGV"
+        window.backgroundColor = NSColor(srgbRed: 0x1a/255, green: 0x1b/255, blue: 0x26/255, alpha: 1)
         window.center()
         window.isReleasedWhenClosed = false
         window.minSize = NSSize(width: 800, height: 500)
@@ -167,23 +186,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         window.contentView = container
         self.splash = splash
 
+        if let screen = NSScreen.main {
+            window.setFrame(screen.visibleFrame, display: true)
+        }
+
         window.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
     }
 
-    /// Build the 3-pane split layout: sidebar | (center header + main terminal) | side panel
+    /// Build the 3-pane split layout using NSSplitViewController:
+    /// sidebar (glass) | center (header + terminal) | inspector (glass)
     private func installMainLayout() {
-        split = NSSplitView()
-        split.isVertical = true
-        split.dividerStyle = .thin
-        split.translatesAutoresizingMaskIntoConstraints = false
+        splitVC = NSSplitViewController()
 
         sidebar = SidebarView(frame: .zero)
         sidebar.onSelectSession = { [weak self] s in self?.openSessionPair(s) }
-        sidebar.onKillSession = { [weak self] s in Task { await self?.killSession(s) } }
+        sidebar.onKillSession = { [weak self] s in self?.killSession(s) }
         sidebar.onNewSession = { [weak self] in self?.showNewSessionSheet() }
 
-        // Center column: header + content (terminal OR empty-state splash)
+        let sidebarVC = NSViewController()
+        sidebarVC.view = sidebar
+        let sidebarItem = NSSplitViewItem(sidebarWithViewController: sidebarVC)
+        sidebarItem.minimumThickness = 220
+        sidebarItem.maximumThickness = 360
+        splitVC.addSplitViewItem(sidebarItem)
+
         centerColumn = NSView()
         centerColumn.wantsLayer = true
         centerColumn.layer?.backgroundColor = NSColor(srgbRed: 0x1a/255, green: 0x1b/255, blue: 0x26/255, alpha: 1).cgColor
@@ -192,7 +219,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         centerHeader.translatesAutoresizingMaskIntoConstraints = false
         centerHeader.onShowSidePanel = { [weak self] in self?.setSidePanel(visible: true) }
         centerHeader.onSelectTab = { [weak self] id in self?.switchMainTab(id: id) }
-        centerHeader.onCloseTab = nil
+        centerHeader.onCloseTab = { [weak self] id in self?.closeFileTab(id: id) }
 
         mainContainer = NSView()
         mainContainer.wantsLayer = true
@@ -211,59 +238,62 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             mainContainer.bottomAnchor.constraint(equalTo: centerColumn.bottomAnchor),
         ])
 
+        let centerVC = NSViewController()
+        centerVC.view = centerColumn
+        let centerItem = NSSplitViewItem(viewController: centerVC)
+        centerItem.minimumThickness = 400
+        splitVC.addSplitViewItem(centerItem)
+
         sidePanel = SidePanelView()
         sidePanel.onCollapse = { [weak self] in self?.setSidePanel(visible: false) }
         sidePanel.fileTreeView.onFileClicked = { [weak self] path in self?.openFileTab(path: path) }
         sidePanel.gitStatusView.onFileClicked = { [weak self] path in self?.openDiffTab(path: path) }
-        sidePanel.gitStatusView.onCommit = { [weak self] msg in
-            guard let self = self, let session = self.activeSession, let manager = self.sessionManager else { return }
+        sidePanel.gitStatusView.onCommitAndPush = { [weak self] msg in
+            guard let self = self,
+                  let session = self.store?.activeSessionName,
+                  let manager = self.sessionManager else { return }
             Task {
                 do {
+                    self.sidebar.setStatus("Committing…")
                     try await manager.gitCommit(container: session, message: msg)
-                    await self.refreshGitStatus()
-                } catch {
-                    self.sidebar.setStatus("✕ commit failed: \(error)")
-                }
-            }
-        }
-        sidePanel.gitStatusView.onPush = { [weak self] in
-            guard let self = self, let session = self.activeSession, let manager = self.sessionManager else { return }
-            Task {
-                do {
+                    self.sidebar.setStatus("Pushing…")
                     try await manager.gitPush(container: session)
-                    await self.refreshGitStatus()
-                    self.sidebar.setStatus("Pushed")
+                    self.sidebar.setStatus("Creating PR…")
+                    try await manager.gitCreatePR(container: session, title: msg)
+                    await self.store?.refreshActive()
+                    self.sidebar.setStatus("PR created")
                 } catch {
-                    self.sidebar.setStatus("✕ push failed: \(error)")
+                    await self.store?.refreshActive()
+                    self.sidebar.setStatus("✕ \(error)")
                 }
             }
         }
 
-        // Start with just sidebar + center. Side panel is added/removed by setSidePanel.
-        split.addArrangedSubview(sidebar)
-        split.addArrangedSubview(centerColumn)
-        split.delegate = self
-        split.setHoldingPriority(NSLayoutConstraint.Priority(260), forSubviewAt: 0)
+        let sidePanelVC = NSViewController()
+        sidePanelVC.view = sidePanel
+        sidePanelItem = NSSplitViewItem(inspectorWithViewController: sidePanelVC)
+        sidePanelItem.minimumThickness = 200
+        sidePanelItem.maximumThickness = 500
+        sidePanelItem.isCollapsed = true
+        splitVC.addSplitViewItem(sidePanelItem)
+
         sidePanelVisible = false
 
-        let container = NSView()
-        container.addSubview(split)
-        NSLayoutConstraint.activate([
-            split.topAnchor.constraint(equalTo: container.topAnchor),
-            split.leadingAnchor.constraint(equalTo: container.leadingAnchor),
-            split.trailingAnchor.constraint(equalTo: container.trailingAnchor),
-            split.bottomAnchor.constraint(equalTo: container.bottomAnchor),
-        ])
+        splitVC.preferredContentSize = window.frame.size
+        window.contentViewController = splitVC
 
-        window.contentView = container
+        let toolbar = NSToolbar(identifier: "main")
+        toolbar.displayMode = .iconOnly
+        window.toolbar = toolbar
+        window.toolbarStyle = .unified
+        window.titlebarSeparatorStyle = .none
 
-        // Set sidebar width
-        DispatchQueue.main.async { [weak self] in
-            self?.split.setPosition(260, ofDividerAt: 0)
+        if let screen = NSScreen.main {
+            window.setFrame(screen.visibleFrame, display: true)
         }
     }
 
-    /// Splash → connect → install main UI → list sessions.
+    /// Splash → connect → install main UI → wire the store.
     private func bootstrap() async {
         guard let loaded = TGVConfig.load() else {
             splash?.setError("No config — run `tgv init` first")
@@ -294,17 +324,33 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             showEmptyState()
 
             sidebar.setServer(config.sshTarget)
-            await refreshSessions()
+
+            let store = SessionStore(manager: manager, repoURL: config.repoURL)
+            self.store = store
+            sidebar.bind(store: store)
+
+            // Menubar counter follows the store's running-session count.
+            store.$sessions
+                .map { sessions in sessions.values.filter { $0.status == .running }.count }
+                .removeDuplicates()
+                .receive(on: RunLoop.main)
+                .sink { [weak self] running in self?.updateMenuBarTitle(running: running) }
+                .store(in: &storeCancellables)
+
+            // When the store loses its connection, schedule SSH reconnection.
+            store.$isConnected
+                .removeDuplicates()
+                .receive(on: RunLoop.main)
+                .sink { [weak self] connected in
+                    if !connected { self?.startReconnectTimer() }
+                }
+                .store(in: &storeCancellables)
+
+            store.start()
             await refreshMetrics()
 
-            refreshTimer = Timer.scheduledTimer(withTimeInterval: 30, repeats: true) { [weak self] _ in
-                Task { await self?.refreshSessions() }
-            }
             metricsTimer = Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { [weak self] _ in
                 Task { await self?.refreshMetrics() }
-            }
-            gitStatusTimer = Timer.scheduledTimer(withTimeInterval: 3, repeats: true) { [weak self] _ in
-                Task { await self?.refreshGitStatus() }
             }
         } catch {
             splash?.setError("✕ \(error)")
@@ -315,49 +361,38 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    private func refreshSessions() async {
-        guard let manager = sessionManager else { return }
-        do {
-            let sessions = try await manager.listSessions()
-            sidebar.setSessions(sessions)
-            let running = sessions.filter(\.running).count
-            sidebar.setStatus("\(sessions.count) session(s), \(running) running")
-            updateMenuBarTitle(running: running)
-        } catch {
-            sidebar.setStatus("✕ \(error)")
-        }
-    }
-
     private func refreshMetrics() async {
         guard let manager = sessionManager else { return }
         do {
             let metrics = try await manager.hostMetrics()
             sidebar.metricsView.update(metrics)
         } catch {
-            sidebar.metricsView.setError()
+            // Keep showing last metrics on failure — store.isConnected covers the warning.
+            startReconnectTimer()
         }
     }
 
-    private func refreshGitStatus() async {
-        guard let manager = sessionManager, let active = activeSession else { return }
+    // MARK: - Connection recovery
+
+    private func startReconnectTimer() {
+        guard reconnectTimer == nil else { return }
+        reconnectTimer = Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { [weak self] _ in
+            Task { await self?.attemptReconnect() }
+        }
+    }
+
+    private func attemptReconnect() async {
+        guard let ssh = ssh else { return }
+        await ssh.resetConnection()
         do {
-            async let statusTask = manager.gitStatusRaw(container: active)
-            async let logTask = manager.gitLogRaw(container: active, count: 20)
-            async let filesTask = manager.fileListRaw(container: active)
-            let (statusRaw, logRaw, filesRaw) = try await (statusTask, logTask, filesTask)
-
-            let status = GitStatus.parse(statusRaw)
-            let commits = GitStatus.parseLog(logRaw)
-            sidePanel.gitStatusView.updateAll(status: status, commits: commits)
-
-            let paths = filesRaw.components(separatedBy: "\n").filter { !$0.isEmpty }
-            currentFilePaths = paths
-            let tree = FileNode.buildTree(from: paths)
-            sidePanel.fileTreeView.update(tree)
-
+            try await ssh.connect()
+            await store?.refreshSessionList()
+            await store?.refreshActive()
+            await refreshMetrics()
+            reconnectTimer?.invalidate()
+            reconnectTimer = nil
         } catch {
-            sidePanel.gitStatusView.setError("git status failed")
-            sidePanel.fileTreeView.setError("file list failed")
+            // Still down — timer will retry.
         }
     }
 
@@ -365,80 +400,111 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         statusItem.button?.title = running > 0 ? "\(running)" : ""
     }
 
-    // MARK: - Session pair management
+    // MARK: - Active session dispatch
 
-    private func openSessionPair(_ session: Session) {
-        if let existing = panes[session.name] {
-            activate(session: session, panes: existing)
+    private func openSessionPair(_ state: SessionState) {
+        activeStateCancellables.removeAll()
+        store?.setActive(state.name)
+        centerHeader.bind(state: state)
+        sidePanel.bind(state: state)
+
+        applyStatus(state: state)
+
+        // React to status transitions (e.g. CREATING → RUNNING) while this
+        // session stays active. Ignore the immediate emission — applyStatus has
+        // already handled the current value above.
+        state.$status
+            .dropFirst()
+            .receive(on: RunLoop.main)
+            .sink { [weak self, weak state] _ in
+                guard let self = self, let state = state else { return }
+                guard self.store?.activeSessionName == state.name else { return }
+                self.applyStatus(state: state)
+            }
+            .store(in: &activeStateCancellables)
+
+        window.title = "TGV — \(state.label)"
+    }
+
+    private func applyStatus(state: SessionState) {
+        switch state.status {
+        case .running:
+            attachTerminals(state)
+        case .creating, .deleting, .stopped:
+            showStatusSplash(for: state)
+        }
+    }
+
+    private func attachTerminals(_ state: SessionState) {
+        if let existing = panes[state.name] {
+            activate(state: state, panes: existing)
             return
         }
-        guard let ssh = ssh, let manager = sessionManager, let config = config else { return }
+        guard let manager = sessionManager, let config = config else { return }
 
-        sidebar.setStatus("Preparing \(session.label)…")
+        let attachCmd = manager.attachCommand(container: state.name)
+        let sshTarget = config.sshTarget
 
-        Task { [weak self] in
-            do {
-                try await manager.ensureTools(container: session.name)
-            } catch {
-                await MainActor.run {
-                    self?.sidebar.setStatus("✕ tools setup failed: \(error)")
-                }
-                // Continue anyway — attach command has a zellij fallback
-            }
+        let mainTab = TerminalTabView(sshTarget: sshTarget, command: attachCmd)
+        let shellCmd = "docker exec -u dev -it -w /workspace/repo \(state.name) zsh"
+        let shellTab = TerminalTabView(sshTarget: sshTarget, command: shellCmd)
 
-            await MainActor.run {
-                guard let self = self else { return }
-                self.sidebar.setStatus("")
+        let sessionPanes = SessionPanes(main: mainTab, shell: shellTab)
+        panes[state.name] = sessionPanes
+        activate(state: state, panes: sessionPanes)
 
-                let attachCmd = manager.attachCommand(container: session.name)
-                let sshTarget = config.sshTarget
-
-                let mainTab = TerminalTabView(sshTarget: sshTarget, command: attachCmd)
-
-                let shellCmd = "docker exec -u dev -it -w /workspace/repo \(session.name) zsh"
-                let shellTab = TerminalTabView(sshTarget: sshTarget, command: shellCmd)
-
-                let panes = SessionPanes(main: mainTab, shell: shellTab)
-                self.panes[session.name] = panes
-                self.activate(session: session, panes: panes)
-
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
-                    for tab in panes.all { tab.connect() }
-                }
-            }
+        window.contentView?.layoutSubtreeIfNeeded()
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
+            for tab in sessionPanes.all { tab.connect() }
         }
     }
 
-    private func activate(session: Session, panes pair: SessionPanes) {
+    private func activate(state: SessionState, panes pair: SessionPanes) {
+        emptyStateSplash?.detachLog()
         emptyStateSplash = nil
-        setSidePanel(visible: true)
+        setSidePanel(visible: true, animated: false)
 
-        // Swap main
-        for sub in mainContainer.subviews { sub.removeFromSuperview() }
-        pair.main.translatesAutoresizingMaskIntoConstraints = false
-        mainContainer.addSubview(pair.main)
-        NSLayoutConstraint.activate([
-            pair.main.topAnchor.constraint(equalTo: mainContainer.topAnchor),
-            pair.main.leadingAnchor.constraint(equalTo: mainContainer.leadingAnchor),
-            pair.main.trailingAnchor.constraint(equalTo: mainContainer.trailingAnchor),
-            pair.main.bottomAnchor.constraint(equalTo: mainContainer.bottomAnchor),
-        ])
-
-        // Side panel: terminal tab gets the shell, files + git are native views
+        switchMainTab(id: pair.activeTabID)
         sidePanel.terminalView = pair.shell
-
-        activeSession = session.name
-        sidebar.setSelected(session.id)
-        centerHeader.setSession(session)
-        window.title = "TGV — \(session.label)"
     }
 
-    /// Show the gradient banner full-width as empty-state placeholder.
-    /// Hides the side panel so the banner fills the whole content area.
+    /// Show the gradient splash with a live status log for sessions that aren't
+    /// RUNNING. Subsequent transitions to `.running` will rebuild this pane via
+    /// the status subscription in `openSessionPair`.
+    private func showStatusSplash(for state: SessionState) {
+        for sub in mainContainer.subviews { sub.removeFromSuperview() }
+        centerHeader.setTabs([], activeID: "agent")
+        sidePanel.clearAllTerminals()
+        setSidePanel(visible: false)
+
+        let splash = SplashView(frame: .zero)
+        splash.translatesAutoresizingMaskIntoConstraints = false
+        switch state.status {
+        case .creating:
+            splash.setStatus("Preparing \(state.label)…")
+        case .deleting:
+            splash.setStatus("Stopping \(state.label)…")
+        case .stopped:
+            splash.setStatus("\(state.label) — stopped")
+        case .running:
+            splash.setStatus(state.label)
+        }
+        mainContainer.addSubview(splash)
+        NSLayoutConstraint.activate([
+            splash.topAnchor.constraint(equalTo: mainContainer.topAnchor),
+            splash.leadingAnchor.constraint(equalTo: mainContainer.leadingAnchor),
+            splash.trailingAnchor.constraint(equalTo: mainContainer.trailingAnchor),
+            splash.bottomAnchor.constraint(equalTo: mainContainer.bottomAnchor),
+        ])
+        splash.attachLog(state.$statusLog)
+        emptyStateSplash = splash
+    }
+
+    /// Banner with no bound session.
     private func showEmptyState() {
         for sub in mainContainer.subviews { sub.removeFromSuperview() }
         let splash = SplashView(frame: .zero)
-        splash.setStatus("Pick a session or create a new one")
+        splash.setStatus("")
         splash.translatesAutoresizingMaskIntoConstraints = false
         mainContainer.addSubview(splash)
         NSLayoutConstraint.activate([
@@ -448,80 +514,54 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             splash.bottomAnchor.constraint(equalTo: mainContainer.bottomAnchor),
         ])
         emptyStateSplash = splash
-        centerHeader.setSession(nil)
+        centerHeader.bind(state: nil)
+        sidePanel.bind(state: nil)
         sidePanel.clearAllTerminals()
         setSidePanel(visible: false)
         window.title = "TGV"
     }
 
-    /// Toggle the right side panel by adding/removing it from the split view.
-    private func setSidePanel(visible: Bool) {
+    private func setSidePanel(visible: Bool, animated: Bool = true) {
         guard visible != sidePanelVisible else { return }
         sidePanelVisible = visible
         centerHeader.setSidePanelVisible(visible)
-
-        if visible {
-            split.addArrangedSubview(sidePanel)
-            // Center holds its size; side panel absorbs window resize
-            split.setHoldingPriority(NSLayoutConstraint.Priority(260), forSubviewAt: 1)
-            split.setHoldingPriority(NSLayoutConstraint.Priority(240), forSubviewAt: 2)
-            DispatchQueue.main.async { [weak self] in
-                guard let self = self else { return }
-                let totalWidth = self.split.bounds.width
-                self.split.setPosition(totalWidth - 380, ofDividerAt: 1)
-            }
+        if animated {
+            sidePanelItem.animator().isCollapsed = !visible
         } else {
-            sidePanel.removeFromSuperview()
+            sidePanelItem.isCollapsed = !visible
         }
     }
 
-    private func killSession(_ session: Session) async {
-        guard let manager = sessionManager else { return }
-        // Tear down panes (close + remove all 4 terminal views)
-        if let pair = panes.removeValue(forKey: session.name) {
+    private func killSession(_ state: SessionState) {
+        // Tear down cached terminal panes immediately so we don't leave dead PTYs.
+        if let pair = panes.removeValue(forKey: state.name) {
             for tab in pair.all {
                 tab.close()
                 tab.removeFromSuperview()
             }
         }
-        if activeSession == session.name {
-            activeSession = nil
-            sidebar.setSelected(nil)
+        // If we were viewing this session, drop to empty state before flipping
+        // status to DELETING — otherwise the status-subscription would briefly
+        // swap in the "Stopping…" splash on top of our teardown.
+        if store?.activeSessionName == state.name {
+            activeStateCancellables.removeAll()
+            store?.setActive(nil)
             showEmptyState()
         }
-
-        sidebar.setStatus("Killing \(session.label)…")
-        do {
-            try await manager.stop(name: session.name)
-        } catch {
-            sidebar.setStatus("✕ \(error)")
-            return
-        }
-        await refreshSessions()
+        store?.kill(name: state.name)
     }
 
     private func showNewSessionSheet() {
-        guard let manager = sessionManager else { return }
+        guard let store = store else { return }
 
-        let sheet = NewSessionSheet(manager: manager,
-            onStep: { [weak self] step in
-                Task { @MainActor in
-                    self?.emptyStateSplash?.setStatus(step)
-                }
-            },
-            onBranchPicked: { [weak self] branch in
-                Task { @MainActor in
-                    // Show splash + temp row in sidebar as soon as branch is picked
-                    if self?.emptyStateSplash == nil {
-                        self?.showEmptyState()
-                    }
-                    self?.sidebar.setCreatingSession(branch: branch)
-                }
-            },
-            onCreated: { [weak self] containerName in
-                Task { await self?.handleNewSession(name: containerName) }
+        let sheet = NewSessionSheet { [weak self] title, prompt in
+            Task { @MainActor in
+                guard let self = self else { return }
+                let state = store.spawn(title: title, prompt: prompt)
+                // Select the new session so its splash + log becomes visible.
+                self.openSessionPair(state)
             }
-        )
+        }
         newSessionSheet = sheet
         if let sheetWindow = sheet.window {
             window.beginSheet(sheetWindow) { _ in
@@ -530,42 +570,26 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    private func handleNewSession(name: String) async {
-        // Show banner with "preparing" message while the session boots
-        if emptyStateSplash == nil {
-            showEmptyState()
-        }
-        emptyStateSplash?.setStatus("Preparing session…")
-
-        await refreshSessions()
-        // Find the freshly created session and auto-attach
-        guard let manager = sessionManager else { return }
-        if let sessions = try? await manager.listSessions(),
-           let created = sessions.first(where: { $0.name == name }) {
-            emptyStateSplash?.setStatus("Attaching to \(created.label)…")
-            openSessionPair(created)
-        }
-    }
-
     // MARK: - Main column tab management
 
-    /// Switch the visible view in mainContainer to the tab with the given id.
+    /// Swap the view mounted in `mainContainer` to the tab with this id and
+    /// reflect the selection in the header.
     private func switchMainTab(id: String) {
-        guard let session = activeSession, let pair = panes[session] else { return }
-
-        for sub in mainContainer.subviews { sub.removeFromSuperview() }
+        guard let session = store?.activeSessionName, var pair = panes[session] else { return }
 
         let view: NSView
-        switch id {
-        case "agent":
+        if id == "agent" {
             view = pair.main
-        case "edit":
-            guard let edit = pair.edit else { return }
-            view = edit
-        default:
+        } else if let tab = pair.fileTabs.first(where: { $0.id == id }) {
+            view = tab.terminal
+        } else {
             return
         }
 
+        pair.activeTabID = id
+        panes[session] = pair
+
+        for sub in mainContainer.subviews { sub.removeFromSuperview() }
         view.translatesAutoresizingMaskIntoConstraints = false
         mainContainer.addSubview(view)
         NSLayoutConstraint.activate([
@@ -574,54 +598,78 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             view.trailingAnchor.constraint(equalTo: mainContainer.trailingAnchor),
             view.bottomAnchor.constraint(equalTo: mainContainer.bottomAnchor),
         ])
+
+        refreshHeaderTabs(session: session)
     }
 
-    /// Open a file in nvim in the Edit tab, replacing any previously opened file.
+    private func refreshHeaderTabs(session: String) {
+        guard let pair = panes[session] else { return }
+        var items: [CenterHeaderView.TabItem] = [
+            .init(id: "agent", label: "Agent", closable: false)
+        ]
+        for tab in pair.fileTabs {
+            items.append(.init(id: tab.id, label: tab.label, closable: true))
+        }
+        centerHeader.setTabs(items, activeID: pair.activeTabID)
+    }
+
     private func openFileTab(path: String) {
-        guard let session = activeSession, let config = config else { return }
-        let filename = (path as NSString).lastPathComponent
-
-        // Close the previous edit terminal if any
-        if let old = panes[session]?.edit {
-            old.close()
-            old.removeFromSuperview()
-        }
-
-        let cmd = "docker exec -u dev -it -w /workspace/repo \(session) nvim \(path)"
-        let tab = TerminalTabView(sshTarget: config.sshTarget, command: cmd)
-        panes[session]?.edit = tab
-
-        centerHeader.setEditTitle(filename)
-        centerHeader.selectTab(id: "edit")
-        switchMainTab(id: "edit")
-
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
-            tab.connect()
+        openOrFocusTab(id: "file:\(path)", path: path) { session in
+            "docker exec -u dev -it -w /workspace/repo \(session) nvim \(path)"
         }
     }
 
-    /// Open a delta diff for a file in the Edit tab.
     private func openDiffTab(path: String) {
-        guard let session = activeSession, let config = config else { return }
-        let filename = (path as NSString).lastPathComponent
+        openOrFocusTab(id: "diff:\(path)", path: path) { session in
+            "docker exec -u dev -it -w /workspace/repo \(session) tgv-diff \(path)"
+        }
+    }
 
-        // Close the previous edit terminal if any
-        if let old = panes[session]?.edit {
-            old.close()
-            old.removeFromSuperview()
+    private func openOrFocusTab(id: String, path: String, makeCmd: (String) -> String) {
+        guard let session = store?.activeSessionName,
+              let config = config,
+              var pair = panes[session] else { return }
+
+        // If a tab for this path+kind already exists, just focus it.
+        if pair.fileTabs.contains(where: { $0.id == id }) {
+            switchMainTab(id: id)
+            return
         }
 
-        let cmd = "docker exec -u dev -it -w /workspace/repo \(session) tgv-diff \(path)"
-        let tab = TerminalTabView(sshTarget: config.sshTarget, command: cmd)
-        panes[session]?.edit = tab
+        let label = (path as NSString).lastPathComponent
+        let terminal = TerminalTabView(sshTarget: config.sshTarget, command: makeCmd(session))
+        pair.fileTabs.append(FileTab(id: id, label: label, terminal: terminal))
+        panes[session] = pair
 
-        centerHeader.setEditTitle(filename)
-        centerHeader.selectTab(id: "edit")
-        switchMainTab(id: "edit")
+        switchMainTab(id: id)
 
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
-            tab.connect()
+            terminal.connect()
         }
+    }
+
+    private func closeFileTab(id: String) {
+        guard let session = store?.activeSessionName, var pair = panes[session] else { return }
+        guard let idx = pair.fileTabs.firstIndex(where: { $0.id == id }) else { return }
+
+        let removed = pair.fileTabs.remove(at: idx)
+        removed.terminal.close()
+        removed.terminal.removeFromSuperview()
+
+        // If the closed tab was active, fall back to the neighbor on the left
+        // (or agent when no file tabs remain).
+        if pair.activeTabID == id {
+            if idx > 0 {
+                pair.activeTabID = pair.fileTabs[idx - 1].id
+            } else if let first = pair.fileTabs.first {
+                pair.activeTabID = first.id
+            } else {
+                pair.activeTabID = "agent"
+            }
+        }
+
+        panes[session] = pair
+        switchMainTab(id: pair.activeTabID)
     }
 
     @objc private func toggleWindow() {
@@ -634,31 +682,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 }
 
-// MARK: - NSSplitViewDelegate
-
-extension AppDelegate: NSSplitViewDelegate {
-    func splitView(_ splitView: NSSplitView, constrainMinCoordinate proposedMinimumPosition: CGFloat, ofSubviewAt dividerIndex: Int) -> CGFloat {
-        if dividerIndex == 0 {
-            return 220 // sidebar min width
-        }
-        // Right divider: center column needs at least 400px
-        return splitView.arrangedSubviews[0].frame.width + splitView.dividerThickness + 400
-    }
-
-    func splitView(_ splitView: NSSplitView, constrainMaxCoordinate proposedMaximumPosition: CGFloat, ofSubviewAt dividerIndex: Int) -> CGFloat {
-        if dividerIndex == 0 {
-            return 360 // sidebar max width
-        }
-        // Right divider: side panel needs at least 200px
-        return splitView.bounds.width - 200
-    }
-}
-
 // MARK: - Main entry
 
 @main
 struct TGVMain {
     static func main() {
+        let args = CommandLine.arguments
+        if let i = args.firstIndex(of: "--export-iconset"), i + 1 < args.count {
+            let dir = URL(fileURLWithPath: args[i + 1])
+            do {
+                try IconExport.writeIconset(to: dir)
+                FileHandle.standardOutput.write(Data("wrote iconset to \(dir.path)\n".utf8))
+                exit(0)
+            } catch {
+                FileHandle.standardError.write(Data("iconset export failed: \(error)\n".utf8))
+                exit(1)
+            }
+        }
+
         let app = NSApplication.shared
         app.setActivationPolicy(.regular)
         let delegate = AppDelegate()
