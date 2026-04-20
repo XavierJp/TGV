@@ -8,7 +8,7 @@ import SwiftTerm
 ///   - **SSH PTY** (Citadel): used when mosh is unavailable.
 final class TerminalTabView: NSView, TerminalViewDelegate {
     enum Transport {
-        case mosh(sshTarget: String, command: String)
+        case mosh(sshTarget: String, args: [String])
         case sshPTY(ssh: SSHManager, command: String)
     }
 
@@ -18,8 +18,9 @@ final class TerminalTabView: NSView, TerminalViewDelegate {
     private let transport: Transport
 
     /// Create a terminal tab using mosh transport (recommended for interactive use).
-    init(sshTarget: String, command: String) {
-        self.transport = .mosh(sshTarget: sshTarget, command: command)
+    /// `args` is the argv of the remote command (first element is the program).
+    init(sshTarget: String, args: [String]) {
+        self.transport = .mosh(sshTarget: sshTarget, args: args)
         self.terminalView = TerminalView(frame: .zero)
         super.init(frame: .zero)
         setupView()
@@ -69,12 +70,12 @@ final class TerminalTabView: NSView, TerminalViewDelegate {
         }
 
         switch transport {
-        case .mosh(let target, let command):
-            let debug = "[\(cols)x\(rows)] mosh \(target) -- \(command)\r\n"
+        case .mosh(let target, let args):
+            let debug = "[\(cols)x\(rows)] mosh \(target) -- \(args.joined(separator: " "))\r\n"
             terminalView.feed(byteArray: [UInt8](debug.utf8)[...])
             let session = MoshSession(onData: dataHandler)
             self.moshSession = session
-            session.start(sshTarget: target, command: command, cols: cols, rows: rows)
+            session.start(sshTarget: target, commandArgs: args, cols: cols, rows: rows)
 
         case .sshPTY(let ssh, let command):
             guard #available(macOS 15.0, *) else {

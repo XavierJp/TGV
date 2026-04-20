@@ -39,7 +39,11 @@ public final class PTYSession: @unchecked Sendable {
         // Wait for the writer to be available before returning
         let (stream, continuation) = AsyncStream<TTYStdinWriter>.makeStream()
 
-        self.task = Task { [self] in
+        // Capture the onData closure locally so the long-running Task doesn't
+        // retain `self`. Cancelling `task` tears down the channel and breaks
+        // the read loop regardless of the session's lifetime.
+        let onData = self.onData
+        self.task = Task {
             try await client.withPTY(req) { inbound, outbound in
                 continuation.yield(outbound)
                 continuation.finish()
@@ -55,7 +59,7 @@ public final class PTYSession: @unchecked Sendable {
                     case .stderr(let b): buf = b
                     }
                     let data = Data(buf.readableBytesView)
-                    self.onData(data)
+                    onData(data)
                 }
             }
         }

@@ -118,14 +118,16 @@ public final class SessionStore: ObservableObject {
         sessions[name] = state
         recomputeOrder()
 
+        // `onStep` is sync @Sendable — the only way to hop to MainActor from it
+        // is an unstructured Task. Lift it out so the spawn call reads cleanly.
+        let appendLog: @Sendable (String) -> Void = { [weak self] step in
+            Task { @MainActor in self?.sessions[name]?.appendLog(step) }
+        }
+
         Task { [weak self] in
             guard let self = self else { return }
             do {
-                try await self.manager.spawn(name: name, branch: branch, prompt: prompt) { [weak self] step in
-                    Task { @MainActor in
-                        self?.sessions[name]?.appendLog(step)
-                    }
-                }
+                try await self.manager.spawn(name: name, branch: branch, prompt: prompt, onStep: appendLog)
                 if !trimmedTitle.isEmpty {
                     try? await self.manager.rename(name: name, displayName: trimmedTitle)
                 }
@@ -133,9 +135,7 @@ public final class SessionStore: ObservableObject {
                 // RUNNING as soon as docker reports the container Up.
                 await self.refreshSessionList()
             } catch {
-                await MainActor.run { [weak self] in
-                    self?.sessions[name]?.appendLog("✕ \(error)")
-                }
+                appendLog("✕ \(error)")
             }
         }
         return state
@@ -145,14 +145,12 @@ public final class SessionStore: ObservableObject {
         guard let state = sessions[name] else { return }
         state.status = .deleting
         state.appendLog("Stopping…")
-        Task { [weak self] in
+        Task { @MainActor [weak self] in
             guard let self = self else { return }
             do {
                 try await self.manager.stop(name: name)
             } catch {
-                await MainActor.run { [weak self] in
-                    self?.sessions[name]?.appendLog("✕ \(error)")
-                }
+                self.sessions[name]?.appendLog("✕ \(error)")
             }
             await self.refreshSessionList()
         }

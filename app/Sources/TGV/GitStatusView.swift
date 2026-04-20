@@ -42,6 +42,10 @@ final class GitStatusView: NSView {
         setup()
     }
 
+    deinit {
+        staleTimer?.invalidate()
+    }
+
     private func setup() {
         wantsLayer = true
         layer?.backgroundColor = NSColor(srgbRed: 0x1a/255, green: 0x1b/255, blue: 0x26/255, alpha: 1).cgColor

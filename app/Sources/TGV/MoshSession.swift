@@ -20,11 +20,14 @@ public final class MoshSession: @unchecked Sendable {
         self.localProcess = LocalProcess(delegate: dataHandler)
     }
 
-    /// Start a mosh session running `command` on `sshTarget`.
-    public func start(sshTarget: String, command: String, cols: Int, rows: Int) {
-        // Build argv: /usr/bin/env mosh user@host -- <command words>
+    /// Start a mosh session running `commandArgs` (argv) on `sshTarget`.
+    /// Passing argv as a list — not a single string — preserves arguments
+    /// that contain spaces (e.g. file paths). The caller is responsible for
+    /// splitting the remote command into its argv elements.
+    public func start(sshTarget: String, commandArgs: [String], cols: Int, rows: Int) {
+        // Build argv: /usr/bin/env mosh user@host -- <command argv…>
         var args = ["env", "mosh", sshTarget, "--"]
-        args += command.components(separatedBy: " ")
+        args += commandArgs
 
         // Inherit the user's PATH so /opt/homebrew/bin (where mosh lives) is found.
         var env = [

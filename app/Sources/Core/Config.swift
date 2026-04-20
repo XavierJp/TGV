@@ -8,6 +8,8 @@ public struct TGVConfig: Sendable {
     public let dockerImage: String
     public let dockerNetwork: String
     public let defaultBranch: String
+    public let gitName: String
+    public let gitEmail: String
 
     public var sshTarget: String { "\(user)@\(host)" }
 
@@ -21,10 +23,11 @@ public struct TGVConfig: Sendable {
 
     /// Minimal TOML extractor — matches `key = "value"` lines.
     /// Doesn't understand sections; the TGV config has unique keys across sections
-    /// (host, user, image, network, url, default_branch) so this is fine.
+    /// (host, user, image, network, url, default_branch, name, email) so this is fine.
     static func parse(_ contents: String) -> TGVConfig? {
         func get(_ key: String) -> String? {
-            let pattern = "^\\s*\(key)\\s*=\\s*\"([^\"]*)\""
+            let escapedKey = NSRegularExpression.escapedPattern(for: key)
+            let pattern = "^\\s*\(escapedKey)\\s*=\\s*\"([^\"]*)\""
             guard let regex = try? NSRegularExpression(pattern: pattern, options: .anchorsMatchLines) else {
                 return nil
             }
@@ -44,7 +47,9 @@ public struct TGVConfig: Sendable {
             repoURL: get("url") ?? "",
             dockerImage: get("image") ?? "tgv-session:latest",
             dockerNetwork: get("network") ?? "tgv-net",
-            defaultBranch: get("default_branch") ?? "main"
+            defaultBranch: get("default_branch") ?? "main",
+            gitName: get("name") ?? "",
+            gitEmail: get("email") ?? ""
         )
     }
 }

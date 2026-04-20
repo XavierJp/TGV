@@ -22,6 +22,13 @@ public actor SessionManager {
     private let ssh: SSHManager
     private let config: TGVConfig
 
+    // listBranches() spawns a `docker run --rm` on the server. It's called every
+    // time the new-session sheet opens — cache the result briefly so rapid opens
+    // don't hammer docker. TTL is short so new upstream branches still appear.
+    private var cachedBranches: [String]?
+    private var cachedBranchesAt: Date?
+    private static let branchesTTL: TimeInterval = 30
+
     public init(ssh: SSHManager, config: TGVConfig) {
         self.ssh = ssh
         self.config = config
@@ -92,13 +99,18 @@ public actor SessionManager {
 
     // MARK: - Branches
 
-    /// List remote branches from the baked-in image's repo.
+    /// List remote branches from the baked-in image's repo. Cached for `branchesTTL`.
     public func listBranches() async throws -> [String] {
+        if let cached = cachedBranches, let at = cachedBranchesAt,
+           Date().timeIntervalSince(at) < Self.branchesTTL {
+            return cached
+        }
+
         let cmd = "docker run --rm \(config.dockerImage) bash -c 'cd /workspace/repo 2>/dev/null && git branch -r 2>/dev/null'"
         let result = try await ssh.exec(cmd)
         guard !result.stdout.isEmpty else { return [] }
 
-        return result.stdout.components(separatedBy: "\n").compactMap { line in
+        let branches = result.stdout.components(separatedBy: "\n").compactMap { line -> String? in
             let trimmed = line.trimmingCharacters(in: .whitespaces)
             if trimmed.contains("->") { return nil }  // skip HEAD pointer
             if trimmed.hasPrefix("origin/") {
@@ -106,6 +118,9 @@ public actor SessionManager {
             }
             return nil
         }
+        cachedBranches = branches
+        cachedBranchesAt = Date()
+        return branches
     }
 
     // MARK: - Spawn
@@ -451,16 +466,16 @@ public actor SessionManager {
 
     // MARK: - Attach command
 
-    /// Build the docker exec command to attach to a session's tmux.
-    /// `new-session -A` creates the session if it doesn't exist, else attaches.
-    /// On first creation, tmux runs `/usr/local/bin/tgv-codex`, a wrapper
-    /// installed by the entrypoint that reads the mounted prompt file and
-    /// passes it to codex (or runs codex bare when the prompt is empty).
-    /// The wrapper keeps the attach command a flat list of words — mosh splits
-    /// on whitespace, so embedding shell quoting here would break it.
-    public nonisolated func attachCommand(container: String) -> String {
+    /// Build the argv for attaching to a session's tmux via mosh.
+    /// `new-session -A` creates the tmux session if it doesn't exist, else attaches.
+    /// On first creation, tmux runs `/usr/local/bin/tgv-codex`, a wrapper installed
+    /// by the entrypoint that reads the mounted prompt file and forwards it to codex
+    /// (or runs codex bare when the prompt is empty). The wrapper keeps this argv flat
+    /// — we pass it through mosh as a list, so no shell quoting is needed.
+    public nonisolated func attachArgs(container: String) -> [String] {
         precondition(Self.isShellSafe(container), "unsafe container name")
-        return "docker exec -u dev -it -w /workspace/repo \(container) tmux new-session -A -s tgv /usr/local/bin/tgv-codex"
+        return ["docker", "exec", "-u", "dev", "-it", "-w", "/workspace/repo", container,
+                "tmux", "new-session", "-A", "-s", "tgv", "/usr/local/bin/tgv-codex"]
     }
 
     // MARK: - Helpers
@@ -559,10 +574,19 @@ public actor SessionManager {
     // MARK: - Entrypoint script
 
     private func makeEntrypointScript(branch: String) -> String {
-        let gitConfig: String
-        // We don't have git name/email in TGVConfig yet — skip for now.
-        // TODO: read from config.toml [git] section if needed.
-        gitConfig = ""
+        // Inject git user.name / user.email from config.toml so commits made inside
+        // the container are authored by the user (not the docker-baked identity).
+        // Bash single-quoted inside the heredoc: escape any embedded single quotes.
+        func shellEscape(_ s: String) -> String {
+            "'" + s.replacingOccurrences(of: "'", with: "'\\''") + "'"
+        }
+        var gitConfig = ""
+        if !config.gitName.isEmpty {
+            gitConfig += "git config --global user.name \(shellEscape(config.gitName))\n"
+        }
+        if !config.gitEmail.isEmpty {
+            gitConfig += "git config --global user.email \(shellEscape(config.gitEmail))\n"
+        }
 
         return #"""
         #!/bin/bash

@@ -58,7 +58,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         setupMainMenu()
         setupMenuBar()
         setupWindow()
-        installScrollWheelMonitor()
         installCmdPMonitor()
         Task { await bootstrap() }
     }
@@ -110,10 +109,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         metricsTimer?.invalidate()
         reconnectTimer?.invalidate()
         store?.stop()
-    }
-
-    private func installScrollWheelMonitor() {
-        // no-op — kept for symmetry with installCmdPMonitor
     }
 
     /// Intercept Cmd+P to show the native fuzzy file finder.
@@ -442,19 +437,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         guard let manager = sessionManager, let config = config else { return }
 
-        let attachCmd = manager.attachCommand(container: state.name)
+        let attachArgs = manager.attachArgs(container: state.name)
         let sshTarget = config.sshTarget
 
-        let mainTab = TerminalTabView(sshTarget: sshTarget, command: attachCmd)
-        let shellCmd = "docker exec -u dev -it -w /workspace/repo \(state.name) zsh"
-        let shellTab = TerminalTabView(sshTarget: sshTarget, command: shellCmd)
+        let mainTab = TerminalTabView(sshTarget: sshTarget, args: attachArgs)
+        let shellArgs = ["docker", "exec", "-u", "dev", "-it", "-w", "/workspace/repo", state.name, "zsh"]
+        let shellTab = TerminalTabView(sshTarget: sshTarget, args: shellArgs)
 
         let sessionPanes = SessionPanes(main: mainTab, shell: shellTab)
         panes[state.name] = sessionPanes
         activate(state: state, panes: sessionPanes)
 
+        // Connect once the view hierarchy has laid out. Scheduling on the next
+        // runloop tick (vs. an arbitrary delay) guarantees terminalView.bounds is
+        // populated; SwiftTerm's sizeChanged delegate covers any later reflow.
         window.contentView?.layoutSubtreeIfNeeded()
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
+        DispatchQueue.main.async {
             for tab in sessionPanes.all { tab.connect() }
         }
     }
@@ -615,17 +613,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func openFileTab(path: String) {
         openOrFocusTab(id: "file:\(path)", path: path) { session in
-            "docker exec -u dev -it -w /workspace/repo \(session) nvim \(path)"
+            ["docker", "exec", "-u", "dev", "-it", "-w", "/workspace/repo", session, "nvim", path]
         }
     }
 
     private func openDiffTab(path: String) {
         openOrFocusTab(id: "diff:\(path)", path: path) { session in
-            "docker exec -u dev -it -w /workspace/repo \(session) tgv-diff \(path)"
+            ["docker", "exec", "-u", "dev", "-it", "-w", "/workspace/repo", session, "tgv-diff", path]
         }
     }
 
-    private func openOrFocusTab(id: String, path: String, makeCmd: (String) -> String) {
+    private func openOrFocusTab(id: String, path: String, makeArgs: (String) -> [String]) {
         guard let session = store?.activeSessionName,
               let config = config,
               var pair = panes[session] else { return }
@@ -637,13 +635,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         let label = (path as NSString).lastPathComponent
-        let terminal = TerminalTabView(sshTarget: config.sshTarget, command: makeCmd(session))
+        let terminal = TerminalTabView(sshTarget: config.sshTarget, args: makeArgs(session))
         pair.fileTabs.append(FileTab(id: id, label: label, terminal: terminal))
         panes[session] = pair
 
         switchMainTab(id: id)
 
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
+        DispatchQueue.main.async {
             terminal.connect()
         }
     }
