@@ -134,43 +134,51 @@ public actor SessionManager {
         guard Self.isShellSafe(branch) else { throw SessionError.invalidBranch(branch) }
 
         let script = makeEntrypointScript(branch: branch)
-        let scriptB64 = Data(script.utf8).base64EncodedString()
 
-        // Step 1: write entrypoint via base64 (avoids quoting hell)
+        // Step 1: write entrypoint via SFTP. The payload never appears in a shell
+        // command line (previously `echo <b64> | base64 -d > file` exposed the
+        // base64'd content to `ps` for the duration of the exec).
         onStep("Preparing entrypoint")
         _ = try await ssh.exec("mkdir -p /tmp/tgv-scripts && chmod 700 /tmp/tgv-scripts")
-        _ = try await ssh.exec("echo '\(scriptB64)' | base64 -d > /tmp/tgv-scripts/\(name).sh && chmod +x /tmp/tgv-scripts/\(name).sh")
+        _ = try await ssh.exec("mkdir -p /tmp/tgv-meta && chmod 700 /tmp/tgv-meta")
+        try await ssh.writeFile("/tmp/tgv-scripts/\(name).sh", data: Data(script.utf8), permissions: 0o700)
 
-        // Step 2: GitHub token from local gh CLI (non-fatal but logged)
+        // Step 2: GitHub token from local gh CLI (non-fatal but logged).
+        // 0600 so only the SSH user can read the token on the remote host.
         onStep("Configuring credentials")
         if let token = Self.localGHToken() {
-            let tokenB64 = Data(token.utf8).base64EncodedString()
             do {
-                _ = try await ssh.exec("echo '\(tokenB64)' | base64 -d > /tmp/tgv-scripts/\(name).gh && chmod 644 /tmp/tgv-scripts/\(name).gh")
+                try await ssh.writeFile("/tmp/tgv-scripts/\(name).gh", data: Data(token.utf8), permissions: 0o600)
             } catch {
                 onStep("Warning: GitHub token copy failed — \(error)")
             }
         } else {
-            // Touch empty file so the volume mount doesn't fail
+            // Empty file so the read-only docker volume mount doesn't fail.
             do {
-                _ = try await ssh.exec("touch /tmp/tgv-scripts/\(name).gh")
+                try await ssh.writeFile("/tmp/tgv-scripts/\(name).gh", data: Data(), permissions: 0o600)
             } catch {
                 onStep("Warning: could not create empty gh token file — \(error)")
             }
         }
 
-        // Step 3: codex prompt (base64'd if provided, empty file otherwise). The
-        // empty-file fallback keeps the read-only mount valid for sessions spawned
-        // without a prompt — the attach command then just launches codex bare.
+        // Step 3: codex prompt (empty file when absent — keeps the read-only mount
+        // valid; the attach wrapper then just launches codex bare). 0600 because
+        // prompts may contain instructions/secrets the user wouldn't want exposed.
         if let prompt = prompt, !prompt.isEmpty {
             onStep("Recording prompt")
-            let promptB64 = Data(prompt.utf8).base64EncodedString()
-            _ = try await ssh.exec("echo '\(promptB64)' | base64 -d > /tmp/tgv-scripts/\(name).prompt && chmod 644 /tmp/tgv-scripts/\(name).prompt")
+            try await ssh.writeFile("/tmp/tgv-scripts/\(name).prompt", data: Data(prompt.utf8), permissions: 0o600)
         } else {
-            _ = try? await ssh.exec("touch /tmp/tgv-scripts/\(name).prompt")
+            try? await ssh.writeFile("/tmp/tgv-scripts/\(name).prompt", data: Data(), permissions: 0o600)
         }
 
-        // Step 4: docker run
+        // Step 4: docker run.
+        //
+        // Intentionally NO volume for /workspace/repo: a per-session named volume
+        // forces docker to copy the baked-in repo (incl. node_modules / uv caches)
+        // out of the image on first spawn, which can add many seconds of cold
+        // start. Using the container's writable layer instead is a ~instant start
+        // and costs nothing — we `docker rm -f` on stop, so the working tree was
+        // always ephemeral anyway.
         onStep("Starting container")
         let dockerCmd = """
         docker run -d \
@@ -182,7 +190,6 @@ public actor SessionManager {
         -e TERM=xterm-256color \
         -e COLORTERM=truecolor \
         -e LANG=C.UTF-8 \
-        -v tgv-workspace-\(name):/workspace/repo \
         -v tgv-codex-auth:/mnt/codex \
         -v /tmp/tgv-scripts/\(name).sh:/entrypoint.sh:ro \
         -v /tmp/tgv-scripts/\(name).gh:/run/secrets/gh_token:ro \
@@ -202,7 +209,10 @@ public actor SessionManager {
     public func stop(name: String) async throws {
         guard Self.isShellSafe(name) else { throw SessionError.invalidName(name) }
         _ = try await ssh.exec("docker rm -f \(name)")
-        _ = try await ssh.exec("docker volume rm -f tgv-workspace-\(name)")
+        // Best-effort cleanup of volumes left behind by older sessions (before we
+        // switched to the container's writable layer for /workspace/repo). Safe
+        // no-op when the volume doesn't exist.
+        _ = try? await ssh.exec("docker volume rm -f tgv-workspace-\(name)")
         _ = try await ssh.exec("rm -f /tmp/tgv-scripts/\(name).sh /tmp/tgv-scripts/\(name).gh /tmp/tgv-scripts/\(name).prompt /tmp/tgv-meta/\(name).name")
     }
 
@@ -466,16 +476,38 @@ public actor SessionManager {
 
     // MARK: - Attach command
 
-    /// Build the argv for attaching to a session's tmux via mosh.
-    /// `new-session -A` creates the tmux session if it doesn't exist, else attaches.
-    /// On first creation, tmux runs `/usr/local/bin/tgv-codex`, a wrapper installed
-    /// by the entrypoint that reads the mounted prompt file and forwards it to codex
-    /// (or runs codex bare when the prompt is empty). The wrapper keeps this argv flat
-    /// — we pass it through mosh as a list, so no shell quoting is needed.
+    /// Build the argv for attaching to a session's codex via mosh.
+    /// `abduco -A tgv` attaches to the abduco session named `tgv` if it exists,
+    /// otherwise creates it running `/usr/local/bin/tgv-codex` — a wrapper installed
+    /// by the entrypoint that reads the mounted prompt file and execs codex.
+    /// `-e '^q'` sets Ctrl+Q as the detach key (abduco's default is Ctrl+\).
+    /// The bash wrapper blocks until `/tmp/tgv-ready` exists so we don't race the
+    /// entrypoint (otherwise `tgv-codex` may not be on $PATH yet and abduco would
+    /// exit immediately, causing mosh to print "[mosh is exiting.]").
     public nonisolated func attachArgs(container: String) -> [String] {
         precondition(Self.isShellSafe(container), "unsafe container name")
         return ["docker", "exec", "-u", "dev", "-it", "-w", "/workspace/repo", container,
-                "tmux", "new-session", "-A", "-s", "tgv", "/usr/local/bin/tgv-codex"]
+                "bash", "-lc",
+                "until [ -e /tmp/tgv-ready ]; do sleep 0.2; done; exec abduco -e '^q' -A tgv /usr/local/bin/tgv-codex"]
+    }
+
+    /// Build the argv for a plain shell in the session's workspace. Waits on the
+    /// entrypoint readiness marker for the same reason as `attachArgs`.
+    public nonisolated func shellArgs(container: String) -> [String] {
+        precondition(Self.isShellSafe(container), "unsafe container name")
+        return ["docker", "exec", "-u", "dev", "-it", "-w", "/workspace/repo", container,
+                "bash", "-lc",
+                "until [ -e /tmp/tgv-ready ]; do sleep 0.2; done; exec zsh"]
+    }
+
+    /// Join an argv array into a single shell-safe command string — needed for
+    /// SSH exec channels, which take one command string (the remote `$SHELL -c`
+    /// parses it). Each argument is wrapped in single quotes with any internal
+    /// single quotes escaped as `'\''`.
+    public nonisolated static func joinShellCommand(_ argv: [String]) -> String {
+        argv.map { arg -> String in
+            "'" + arg.replacingOccurrences(of: "'", with: "'\\''") + "'"
+        }.joined(separator: " ")
     }
 
     // MARK: - Helpers
@@ -576,22 +608,46 @@ public actor SessionManager {
     private func makeEntrypointScript(branch: String) -> String {
         // Inject git user.name / user.email from config.toml so commits made inside
         // the container are authored by the user (not the docker-baked identity).
-        // Bash single-quoted inside the heredoc: escape any embedded single quotes.
+        // shellEscape single-quotes the value for safe bash embedding.
         func shellEscape(_ s: String) -> String {
             "'" + s.replacingOccurrences(of: "'", with: "'\\''") + "'"
         }
-        var gitConfig = ""
+        var gitIdentity = ""
         if !config.gitName.isEmpty {
-            gitConfig += "git config --global user.name \(shellEscape(config.gitName))\n"
+            gitIdentity += "git config --global user.name \(shellEscape(config.gitName))\n"
         }
         if !config.gitEmail.isEmpty {
-            gitConfig += "git config --global user.email \(shellEscape(config.gitEmail))\n"
+            gitIdentity += "git config --global user.email \(shellEscape(config.gitEmail))\n"
         }
 
         return #"""
         #!/bin/bash
-        # Entrypoint runs as root — copies secrets, writes config, then drops to dev
+        # Entrypoint runs as root. Installs the fast/static bits first (so attach
+        # commands waiting on /tmp/tgv-ready never race ahead), then runs the git
+        # work as dev — which kills the need for a `chown -R dev:dev /workspace/repo`
+        # at the end (that recursive walk was seconds of cold start on big repos).
 
+        mkdir -p /home/dev
+
+        # tgv-codex wrapper — reads the mounted prompt file and execs codex.
+        cat > /usr/local/bin/tgv-codex << 'TGVCODEXEOF'
+        #!/bin/bash
+        p=""
+        if [ -r /run/secrets/codex_prompt ]; then
+          p=$(cat /run/secrets/codex_prompt 2>/dev/null)
+        fi
+        # --no-alt-screen: render inline so output lands in the terminal's native
+        # scrollback. With abduco (pass-through), this means SwiftTerm captures the
+        # full codex conversation and scroll wheel works end-to-end.
+        if [ -n "$p" ]; then
+          exec codex --no-alt-screen "$p"
+        else
+          exec codex --no-alt-screen
+        fi
+        TGVCODEXEOF
+        chmod +x /usr/local/bin/tgv-codex
+
+        # gh CLI credentials — chown to dev + 600 so only dev can read the token.
         if [ -f /run/secrets/gh_token ] && [ -s /run/secrets/gh_token ]; then
           GH_TOKEN=$(cat /run/secrets/gh_token)
           mkdir -p /home/dev/.config/gh
@@ -601,29 +657,12 @@ public actor SessionManager {
             user: ""
             git_protocol: https
         GHEOF
+          chown -R dev:dev /home/dev/.config/gh
           chmod 600 /home/dev/.config/gh/hosts.yml
-          git config --global credential.https://github.com.helper '!gh auth git-credential'
-        fi
-
-        \#(gitConfig)
-
-        cd /workspace/repo
-        git config --global --add safe.directory /workspace/repo
-        git fetch --all 2>/dev/null
-        if git checkout \#(branch) 2>/dev/null; then
-          git pull --ff-only 2>/dev/null
-        elif git checkout -b \#(branch) origin/\#(branch) 2>/dev/null; then
-          true
-        else
-          git checkout origin/main 2>/dev/null
-          git checkout -b \#(branch) 2>/dev/null
         fi
 
         # Persist Codex config + auth across container restarts via the shared
-        # tgv-codex-auth volume mounted at /mnt/codex. On first boot, seed it
-        # with the image's ~/.codex baseline (AGENTS.md etc. from `rtk init`),
-        # then replace the real ~/.codex with a symlink so codex writes auth
-        # tokens into the persistent volume instead of the ephemeral container.
+        # tgv-codex-auth volume. Tiny dir, so the `chown -R` here is cheap.
         if [ -z "$(ls -A /mnt/codex 2>/dev/null)" ] && [ -d /home/dev/.codex ]; then
           cp -a /home/dev/.codex/. /mnt/codex/
         fi
@@ -632,47 +671,50 @@ public actor SessionManager {
         ln -s /mnt/codex /home/dev/.codex
         chown -h dev:dev /home/dev/.codex
 
-        # Default codex to full-auto mode
-        if [ ! -f /mnt/codex/config.json ]; then
-          cat > /mnt/codex/config.json << 'CODEXEOF'
-        {"approval_mode":"full-auto"}
+        # Modern codex reads ~/.codex/config.toml. approval_policy = "never"
+        # suppresses all approval prompts; sandbox_mode = "danger-full-access"
+        # drops the filesystem/network sandbox. Together these are codex's
+        # equivalent of Claude's --dangerously-skip-permissions / YOLO mode.
+        if [ ! -f /mnt/codex/config.toml ]; then
+          cat > /mnt/codex/config.toml << 'CODEXEOF'
+        approval_policy = "never"
+        sandbox_mode = "danger-full-access"
         CODEXEOF
-          chown dev:dev /mnt/codex/config.json
+          chown dev:dev /mnt/codex/config.toml
         fi
 
-        # Install /usr/local/bin/tgv-codex — wrapper that reads the mounted
-        # prompt file and forwards it to codex. Keeps the client-side attach
-        # command a flat argv list (mosh splits args on whitespace, so any
-        # shell quoting here would get mangled on the way to the remote host).
-        cat > /usr/local/bin/tgv-codex << 'TGVCODEXEOF'
-        #!/bin/bash
-        p=""
-        if [ -r /run/secrets/codex_prompt ]; then
-          p=$(cat /run/secrets/codex_prompt 2>/dev/null)
-        fi
-        if [ -n "$p" ]; then
-          exec codex "$p"
+        # All git work runs as dev — so:
+        #   (a) user.name/user.email land in /home/dev/.gitconfig where dev-user
+        #       commits will actually read them (previously they went to root's
+        #       gitconfig and had no effect);
+        #   (b) any .git/ objects created by fetch are dev-owned from the start,
+        #       so we don't need a recursive `chown -R dev:dev /workspace/repo`
+        #       afterwards.
+        # `sudo -H` sets HOME=/home/dev so --global writes to the right gitconfig.
+        sudo -u dev -H bash << 'DEVEOF'
+        git config --global credential.https://github.com.helper '!gh auth git-credential' 2>/dev/null || true
+        \#(gitIdentity)
+        git config --global --add safe.directory /workspace/repo
+        cd /workspace/repo
+        # Targeted fetch: just main + the session branch. `--all` used to pull every
+        # remote ref + all tags which can be many MBs on active repos. `|| true` on
+        # the branch fetch because fresh tgv/* names obviously don't exist upstream.
+        git fetch --no-tags origin main 2>/dev/null || true
+        git fetch --no-tags origin \#(branch) 2>/dev/null || true
+        if git rev-parse --verify "refs/heads/\#(branch)" >/dev/null 2>&1; then
+          git checkout \#(branch) 2>/dev/null
+        elif git rev-parse --verify "refs/remotes/origin/\#(branch)" >/dev/null 2>&1; then
+          git checkout -b \#(branch) "origin/\#(branch)" 2>/dev/null
         else
-          exec codex
+          git checkout -B \#(branch) origin/main 2>/dev/null
         fi
-        TGVCODEXEOF
-        chmod +x /usr/local/bin/tgv-codex
+        DEVEOF
 
-        # tmux config — mouse on so tmux handles scroll wheel; the native
-        # terminal disables mouse reporting client-side so click+drag selection
-        # and Cmd+C still work locally.
-        mkdir -p /home/dev
-        cat > /home/dev/.tmux.conf << 'TMUXEOF'
-        set -g status off
-        set -g mouse on
-        set -g history-limit 50000
-        set -g default-terminal "xterm-256color"
-        set -ga terminal-overrides ",*256col*:Tc"
-        set -g set-clipboard on
-        bind-key -n C-q detach
-        TMUXEOF
+        # Readiness marker — the Swift client's attach command waits on this file
+        # before launching abduco/zsh. Must be the last thing before the long-lived
+        # `sleep infinity` so consumers never race ahead of entrypoint setup.
+        touch /tmp/tgv-ready
 
-        chown -R dev:dev /home/dev /workspace/repo
         exec su dev -c 'sleep infinity'
         """#
     }

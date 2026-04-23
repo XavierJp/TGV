@@ -14,9 +14,9 @@ TGV spins up isolated YOLO containers that run OpenCode with OpenRouter. They ru
 
 ## What's in the box
 
-- **TGV.app** — native macOS app with embedded SwiftTerm. Sidebar of sessions, center pane runs `tmux + opencode`, side panel has Terminal / Files / Git tabs.
+- **TGV.app** — native macOS app with embedded SwiftTerm. Sidebar of sessions, center pane runs `abduco + opencode`, side panel has Terminal / Files / Git tabs.
 - **tgv-init** — bash script that builds the docker image (with your repo baked in) and writes the config the app reads.
-- **docker/Dockerfile** — image with `tmux`, `nvim`, `zsh + oh-my-zsh`, `gh`, `node`, `pnpm`, `uv`, `opencode` all preinstalled.
+- **docker/Dockerfile** — image with `abduco`, `nvim`, `zsh + oh-my-zsh`, `gh`, `node`, `pnpm`, `uv`, `opencode` all preinstalled.
 
 ## Installation
 
@@ -56,13 +56,13 @@ Then launch the **TGV** app from your menu bar (or it'll already be running from
 ## Using the app
 
 - **Sidebar (left)** — list of sessions, `+ New Session` button, host metrics (CPU / GPU / RAM / Disk)
-- **Center** — `tmux` running `opencode` for the active session. `Ctrl+Q` to detach.
+- **Center** — `abduco` running `opencode` for the active session. `Ctrl+Q` to detach.
 - **Right panel** — three tabs:
   - **Terminal** — raw `zsh` shell into the same container
   - **Files** — `tree` view of the workspace
   - **Git** — `watch git status` (auto-refreshes every 2s)
 
-Sessions persist across SSH disconnects via tmux, so you can close the app, reopen it, and pick up exactly where you left off.
+Sessions persist across SSH disconnects via abduco, so you can close the app, reopen it, and pick up exactly where you left off.
 
 ## Uninstall
 
@@ -119,7 +119,7 @@ email = "you@example.com"
 │  TGV.app (Swift + SwiftTerm + Citadel SSH)  │
 │  ┌──────┬─────────────┬─────────────┐       │
 │  │ Side │ Main        │ Side panel  │       │
-│  │ bar  │ (tmux +     │ Term/Files/ │       │
+│  │ bar  │ (abduco +   │ Term/Files/ │       │
 │  │      │  opencode)  │ Git tabs    │       │
 │  └──────┴─────────────┴─────────────┘       │
 └─────────────────────────────────────────────┘
@@ -131,7 +131,7 @@ email = "you@example.com"
 │  Remote server                              │
 │  ┌─────────────┐  ┌─────────────┐           │
 │  │ container1  │  │ container2  │           │
-│  │ tmux+opencode│ │ tmux+opencode│          │
+│  │abduco+opencode│ │abduco+opencode│        │
 │  └─────────────┘  └─────────────┘           │
 └─────────────────────────────────────────────┘
 ```

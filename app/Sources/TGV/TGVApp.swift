@@ -12,7 +12,7 @@ private struct FileTab {
 
 /// Terminals attached to a session container.
 private struct SessionPanes {
-    let main: TerminalTabView      // tmux + codex (center area, "Agent" tab)
+    let main: TerminalTabView      // abduco + codex (center area, "Agent" tab)
     let shell: TerminalTabView     // zsh in /workspace/repo (side: Terminal tab)
     var fileTabs: [FileTab] = []   // user-opened file/diff tabs in the center
     var activeTabID: String = "agent"
@@ -34,9 +34,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var emptyStateSplash: SplashView?
     private var sidePanel: SidePanelView!
     private var splitVC: NSSplitViewController!
+    private var sidebarItem: NSSplitViewItem!
     private var sidePanelItem: NSSplitViewItem!
     private var centerColumn: NSView!
     private var sidePanelVisible = false
+    private var isWindowFilled = false
+    private var preFillSidebarCollapsed = false
+    private var preFillSidePanelCollapsed = true
 
     private var config: TGVConfig?
     private var ssh: SSHManager?
@@ -137,6 +141,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         panel.onDismiss = { [weak self] in
             self?.fuzzyFinder = nil
+            self?.focusActiveMainTerminal()
         }
         panel.show()
         fuzzyFinder = panel
@@ -166,7 +171,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         window.backgroundColor = NSColor(srgbRed: 0x1a/255, green: 0x1b/255, blue: 0x26/255, alpha: 1)
         window.center()
         window.isReleasedWhenClosed = false
-        window.minSize = NSSize(width: 800, height: 500)
+        window.minSize = NSSize(width: 1060, height: 600)
 
         let splash = SplashView(frame: .zero)
         splash.translatesAutoresizingMaskIntoConstraints = false
@@ -180,10 +185,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         ])
         window.contentView = container
         self.splash = splash
-
-        if let screen = NSScreen.main {
-            window.setFrame(screen.visibleFrame, display: true)
-        }
 
         window.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
@@ -201,9 +202,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         let sidebarVC = NSViewController()
         sidebarVC.view = sidebar
-        let sidebarItem = NSSplitViewItem(sidebarWithViewController: sidebarVC)
-        sidebarItem.minimumThickness = 220
-        sidebarItem.maximumThickness = 360
+        sidebarItem = NSSplitViewItem(sidebarWithViewController: sidebarVC)
+        sidebarItem.minimumThickness = 260
         splitVC.addSplitViewItem(sidebarItem)
 
         centerColumn = NSView()
@@ -215,6 +215,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         centerHeader.onShowSidePanel = { [weak self] in self?.setSidePanel(visible: true) }
         centerHeader.onSelectTab = { [weak self] id in self?.switchMainTab(id: id) }
         centerHeader.onCloseTab = { [weak self] id in self?.closeFileTab(id: id) }
+        centerHeader.onToggleFillWindow = { [weak self] in self?.toggleWindowFill() }
 
         mainContainer = NSView()
         mainContainer.wantsLayer = true
@@ -236,7 +237,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let centerVC = NSViewController()
         centerVC.view = centerColumn
         let centerItem = NSSplitViewItem(viewController: centerVC)
-        centerItem.minimumThickness = 400
+        centerItem.minimumThickness = 520
         splitVC.addSplitViewItem(centerItem)
 
         sidePanel = SidePanelView()
@@ -267,25 +268,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let sidePanelVC = NSViewController()
         sidePanelVC.view = sidePanel
         sidePanelItem = NSSplitViewItem(inspectorWithViewController: sidePanelVC)
-        sidePanelItem.minimumThickness = 200
-        sidePanelItem.maximumThickness = 500
+        sidePanelItem.minimumThickness = 280
         sidePanelItem.isCollapsed = true
         splitVC.addSplitViewItem(sidePanelItem)
 
         sidePanelVisible = false
 
-        splitVC.preferredContentSize = window.frame.size
-        window.contentViewController = splitVC
+        // Swap the window's content from the splash container to the split.
+        // `contentViewController` replaces contentView and drives sizing via
+        // the VC's preferredContentSize. Setting that pins the content to a
+        // fixed size and breaks edge-drag resize — switch contentView instead.
+        window.contentView = splitVC.view
 
         let toolbar = NSToolbar(identifier: "main")
         toolbar.displayMode = .iconOnly
         window.toolbar = toolbar
         window.toolbarStyle = .unified
         window.titlebarSeparatorStyle = .none
-
-        if let screen = NSScreen.main {
-            window.setFrame(screen.visibleFrame, display: true)
-        }
     }
 
     /// Splash → connect → install main UI → wire the store.
@@ -418,7 +417,33 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
             .store(in: &activeStateCancellables)
 
+        // Safety net: the 3s git refresh rebuilds GitStatusView's stack and
+        // FileTreeView's NSOutlineView data, and one of those steals first
+        // responder even though terminalView is a sibling, not a child. Re-
+        // focus the terminal after each refresh unless the user has clicked
+        // into another real view (text field, etc.).
+        state.$gitRefreshedAt
+            .dropFirst()
+            .receive(on: RunLoop.main)
+            .sink { [weak self, weak state] _ in
+                guard let self = self, let state = state else { return }
+                guard self.store?.activeSessionName == state.name else { return }
+                self.restoreTerminalFocusIfUnclaimed()
+            }
+            .store(in: &activeStateCancellables)
+
         window.title = "TGV — \(state.label)"
+    }
+
+    /// Put first-responder back on the active main terminal if the current
+    /// responder is the window itself, nil, or a view inside the file-tree /
+    /// git-status refresh path. Leaves real user-grabbed responders alone.
+    private func restoreTerminalFocusIfUnclaimed() {
+        guard let session = store?.activeSessionName, panes[session] != nil else { return }
+        let fr = window.firstResponder
+        if fr == nil || fr === window {
+            focusActiveMainTerminal()
+        }
     }
 
     private func applyStatus(state: SessionState) {
@@ -435,14 +460,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             activate(state: state, panes: existing)
             return
         }
-        guard let manager = sessionManager, let config = config else { return }
+        guard let manager = sessionManager, let ssh = ssh else { return }
 
-        let attachArgs = manager.attachArgs(container: state.name)
-        let sshTarget = config.sshTarget
+        // SSH PTY transport (Citadel) instead of mosh. Reasons:
+        //  - mosh-client activates alt-screen on init (from xterm-256color's
+        //    smcup) which disables SwiftTerm's scrollback buffer.
+        //  - mosh uses absolute-positioning frame-buffer painting, so even in
+        //    main buffer no content ever scrolls into scrollback history.
+        // Session persistence (the main reason to use mosh) is already handled
+        // by abduco on the remote side — a dropped SSH just reattaches.
+        let attachCmd = SessionManager.joinShellCommand(manager.attachArgs(container: state.name))
+        let shellCmd = SessionManager.joinShellCommand(manager.shellArgs(container: state.name))
 
-        let mainTab = TerminalTabView(sshTarget: sshTarget, args: attachArgs)
-        let shellArgs = ["docker", "exec", "-u", "dev", "-it", "-w", "/workspace/repo", state.name, "zsh"]
-        let shellTab = TerminalTabView(sshTarget: sshTarget, args: shellArgs)
+        let mainTab = TerminalTabView(ssh: ssh, command: attachCmd)
+        let shellTab = TerminalTabView(ssh: ssh, command: shellCmd)
 
         let sessionPanes = SessionPanes(main: mainTab, shell: shellTab)
         panes[state.name] = sessionPanes
@@ -517,6 +548,24 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         sidePanel.clearAllTerminals()
         setSidePanel(visible: false)
         window.title = "TGV"
+    }
+
+    /// Double-click on the center header toggles "fill window": collapses both
+    /// the sidebar and the side panel to give the center pane the full window
+    /// width. A second toggle restores the prior collapse state of each.
+    private func toggleWindowFill() {
+        if isWindowFilled {
+            sidebarItem.animator().isCollapsed = preFillSidebarCollapsed
+            setSidePanel(visible: !preFillSidePanelCollapsed)
+            isWindowFilled = false
+        } else {
+            preFillSidebarCollapsed = sidebarItem.isCollapsed
+            preFillSidePanelCollapsed = sidePanelItem.isCollapsed
+            sidebarItem.animator().isCollapsed = true
+            setSidePanel(visible: false)
+            isWindowFilled = true
+        }
+        focusActiveMainTerminal()
     }
 
     private func setSidePanel(visible: Bool, animated: Bool = true) {
@@ -598,6 +647,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         ])
 
         refreshHeaderTabs(session: session)
+
+        // viewDidMoveToWindow handles the re-parent case, but explicit focus
+        // covers same-tab re-clicks and panel animations that don't re-parent.
+        DispatchQueue.main.async { [weak view] in
+            (view as? TerminalTabView)?.focusTerminal()
+        }
+    }
+
+    /// Focus the terminal currently mounted in the center pane. Used after
+    /// modal panels (fuzzy finder) dismiss to return keystrokes to the tab.
+    private func focusActiveMainTerminal() {
+        guard let session = store?.activeSessionName, let pair = panes[session] else { return }
+        let view: TerminalTabView
+        if pair.activeTabID == "agent" {
+            view = pair.main
+        } else if let tab = pair.fileTabs.first(where: { $0.id == pair.activeTabID }) {
+            view = tab.terminal
+        } else {
+            view = pair.main
+        }
+        view.focusTerminal()
     }
 
     private func refreshHeaderTabs(session: String) {

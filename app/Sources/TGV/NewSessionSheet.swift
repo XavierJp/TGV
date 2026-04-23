@@ -3,7 +3,7 @@ import Core
 
 /// New-session sheet: a short title and a prompt for codex.
 /// Title is required; prompt is optional. The branch is derived from the title.
-/// Enter in the title field focuses the prompt; Cmd+Enter submits.
+/// Enter in the title field focuses the prompt; Shift+Enter submits.
 final class NewSessionSheet: NSWindowController, NSTextFieldDelegate, NSTextViewDelegate {
     private let onSubmit: (_ title: String, _ prompt: String) -> Void
 
@@ -66,7 +66,7 @@ final class NewSessionSheet: NSWindowController, NSTextFieldDelegate, NSTextView
         promptScroll.borderType = .bezelBorder
         promptScroll.translatesAutoresizingMaskIntoConstraints = false
 
-        let hint = NSTextField(labelWithString: "⌘↩ to create  ·  esc to cancel")
+        let hint = NSTextField(labelWithString: "⇧↩ to create  ·  esc to cancel")
         hint.font = AppFont.regular(10)
         hint.textColor = .tertiaryLabelColor
         hint.translatesAutoresizingMaskIntoConstraints = false
@@ -75,7 +75,7 @@ final class NewSessionSheet: NSWindowController, NSTextFieldDelegate, NSTextView
         createButton.action = #selector(create)
         createButton.bezelStyle = .rounded
         createButton.keyEquivalent = "\r"
-        createButton.keyEquivalentModifierMask = [.command]
+        createButton.keyEquivalentModifierMask = [.shift]
         createButton.isEnabled = false
         createButton.translatesAutoresizingMaskIntoConstraints = false
 
@@ -163,13 +163,19 @@ final class NewSessionSheet: NSWindowController, NSTextFieldDelegate, NSTextView
     // MARK: - NSTextViewDelegate
 
     func textView(_ textView: NSTextView, doCommandBy commandSelector: Selector) -> Bool {
-        // Cmd+Enter submits from the prompt field.
-        if commandSelector == #selector(NSResponder.insertNewline(_:)),
-           let event = NSApp.currentEvent,
-           event.modifierFlags.contains(.command) {
-            create()
-            return true
+        // Shift+Enter submits from the prompt field. Depending on macOS version
+        // and keyboard layout, Shift+Return can be routed as insertLineBreak:,
+        // insertNewlineIgnoringFieldEditor:, or insertNewline: with the shift
+        // modifier — catch all three. Plain Enter (no shift) still falls through
+        // to the default, which inserts a newline.
+        let isNewlineish = commandSelector == #selector(NSResponder.insertLineBreak(_:))
+            || commandSelector == #selector(NSResponder.insertNewlineIgnoringFieldEditor(_:))
+            || commandSelector == #selector(NSResponder.insertNewline(_:))
+        guard isNewlineish else { return false }
+        guard let event = NSApp.currentEvent, event.modifierFlags.contains(.shift) else {
+            return false
         }
-        return false
+        create()
+        return true
     }
 }

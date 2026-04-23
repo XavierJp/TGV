@@ -25,22 +25,32 @@ public final class MoshSession: @unchecked Sendable {
     /// that contain spaces (e.g. file paths). The caller is responsible for
     /// splitting the remote command into its argv elements.
     public func start(sshTarget: String, commandArgs: [String], cols: Int, rows: Int) {
-        // Build argv: /usr/bin/env mosh user@host -- <command argv…>
-        var args = ["env", "mosh", sshTarget, "--"]
-        args += commandArgs
+        // Resolve mosh to an absolute path. When the app launches from Finder,
+        // PATH is whatever launchd set (typically just /usr/bin:/bin:/usr/sbin:/sbin)
+        // — it doesn't include /opt/homebrew/bin, so `/usr/bin/env mosh` would
+        // fail with "env: mosh: No such file or directory".
+        guard let moshPath = Self.resolveMosh() else {
+            let msg = "\r\n*** mosh binary not found — install with `brew install mosh`.\r\n"
+            onData(Data(msg.utf8))
+            return
+        }
 
-        // Inherit the user's PATH so /opt/homebrew/bin (where mosh lives) is found.
+        // mosh spawns its own ssh child, which needs a PATH with ssh reachable.
+        // Prepend the homebrew prefixes in case the launchd PATH is missing them.
+        var pathComponents = ["/opt/homebrew/bin", "/usr/local/bin"]
+        let parent = ProcessInfo.processInfo.environment
+        if let parentPath = parent["PATH"], !parentPath.isEmpty {
+            pathComponents.append(parentPath)
+        } else {
+            pathComponents.append(contentsOf: ["/usr/bin", "/bin"])
+        }
+
         var env = [
             "TERM=xterm-256color",
             "COLORTERM=truecolor",
             "LANG=en_US.UTF-8",
+            "PATH=\(pathComponents.joined(separator: ":"))",
         ]
-        let parent = ProcessInfo.processInfo.environment
-        if let path = parent["PATH"] {
-            env.append("PATH=\(path)")
-        } else {
-            env.append("PATH=/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin")
-        }
         // Pass through the auth/identity vars mosh's inner SSH handshake needs.
         // Without SSH_AUTH_SOCK the agent can't be reached and pubkey auth fails,
         // which makes the remote shell die and mosh print "[mosh is exiting.]".
@@ -50,14 +60,45 @@ public final class MoshSession: @unchecked Sendable {
             }
         }
 
+        // LocalProcess prepends `execName` as argv[0] internally (see SwiftTerm
+        // LocalProcess.swift). So `args` here must NOT repeat "mosh" — otherwise
+        // mosh parses argv[1] as the target and tries to resolve "mosh" as a host.
+        let args = [sshTarget, "--"] + commandArgs
+
         localProcess.startProcess(
-            executable: "/usr/bin/env",
+            executable: moshPath,
             args: args,
             environment: env,
             execName: "mosh"
         )
 
         resize(cols: cols, rows: rows)
+    }
+
+    /// Search common install locations for the `mosh` binary and return the first
+    /// executable match. Independent of the launched process's PATH.
+    private static func resolveMosh() -> String? {
+        let candidates = [
+            "/opt/homebrew/bin/mosh",
+            "/usr/local/bin/mosh",
+            "/opt/local/bin/mosh",      // MacPorts
+            "/usr/bin/mosh",
+        ]
+        for path in candidates {
+            if FileManager.default.isExecutableFile(atPath: path) {
+                return path
+            }
+        }
+        // Last resort: honor PATH if the app was launched from a shell that has mosh.
+        if let envPath = ProcessInfo.processInfo.environment["PATH"] {
+            for dir in envPath.split(separator: ":") {
+                let candidate = "\(dir)/mosh"
+                if FileManager.default.isExecutableFile(atPath: candidate) {
+                    return candidate
+                }
+            }
+        }
+        return nil
     }
 
     public func write(_ data: Data) {

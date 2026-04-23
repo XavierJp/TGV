@@ -217,15 +217,24 @@ final class SidebarView: NSView {
 
     @objc private func newPressed() { onNewSession?() }
 
+    /// Reconcile `listStack` with the store's ordered names. Reuses existing
+    /// `SessionRow` instances when the id survives — tearing down all rows on
+    /// every refresh steals first-responder from the center terminal whenever
+    /// the 30s session-list poll fires.
     private func rebuildRows() {
-        for row in listStack.arrangedSubviews {
-            listStack.removeArrangedSubview(row)
-            row.removeFromSuperview()
+        guard let store = store else {
+            for v in listStack.arrangedSubviews {
+                listStack.removeArrangedSubview(v)
+                v.removeFromSuperview()
+            }
+            return
         }
 
-        guard let store = store else { return }
-
         if store.orderedNames.isEmpty {
+            for v in listStack.arrangedSubviews {
+                listStack.removeArrangedSubview(v)
+                v.removeFromSuperview()
+            }
             let empty = NSTextField(labelWithString: "No sessions")
             empty.font = AppFont.regular(12)
             empty.textColor = .tertiaryLabelColor
@@ -235,18 +244,45 @@ final class SidebarView: NSView {
             return
         }
 
-        for name in store.orderedNames {
+        let existingRows: [String: SessionRow] = Dictionary(uniqueKeysWithValues:
+            listStack.arrangedSubviews.compactMap { ($0 as? SessionRow).map { ($0.sessionID, $0) } }
+        )
+        let targetIDs = Set(store.orderedNames)
+
+        // Drop rows that are no longer in the list (including the "No sessions" placeholder).
+        for v in listStack.arrangedSubviews {
+            if let row = v as? SessionRow {
+                if !targetIDs.contains(row.sessionID) {
+                    listStack.removeArrangedSubview(row)
+                    row.removeFromSuperview()
+                }
+            } else {
+                listStack.removeArrangedSubview(v)
+                v.removeFromSuperview()
+            }
+        }
+
+        // Ensure rows exist in the correct order. Only insert/move when needed.
+        for (idx, name) in store.orderedNames.enumerated() {
             guard let state = store.sessions[name] else { continue }
-            let row = SessionRow(
-                state: state,
-                selected: state.name == selectedID,
-                onClick: { [weak self] s in self?.onSelectSession?(s) },
-                onKill: { [weak self] s in self?.onKillSession?(s) }
-            )
-            row.translatesAutoresizingMaskIntoConstraints = false
-            listStack.addArrangedSubview(row)
-            row.leadingAnchor.constraint(equalTo: listStack.leadingAnchor).isActive = true
-            row.trailingAnchor.constraint(equalTo: listStack.trailingAnchor).isActive = true
+            if let existing = existingRows[name] {
+                existing.setSelected(name == selectedID)
+                if listStack.arrangedSubviews.firstIndex(of: existing) != idx {
+                    listStack.removeArrangedSubview(existing)
+                    listStack.insertArrangedSubview(existing, at: idx)
+                }
+            } else {
+                let row = SessionRow(
+                    state: state,
+                    selected: name == selectedID,
+                    onClick: { [weak self] s in self?.onSelectSession?(s) },
+                    onKill: { [weak self] s in self?.onKillSession?(s) }
+                )
+                row.translatesAutoresizingMaskIntoConstraints = false
+                listStack.insertArrangedSubview(row, at: idx)
+                row.leadingAnchor.constraint(equalTo: listStack.leadingAnchor).isActive = true
+                row.trailingAnchor.constraint(equalTo: listStack.trailingAnchor).isActive = true
+            }
         }
     }
 
@@ -262,7 +298,7 @@ final class SessionRow: NSView {
     private let onKill: (SessionState) -> Void
     private let trackingArea: NSTrackingArea
     private var isHovering = false
-    private let isSelected: Bool
+    private var isSelected: Bool
     private let dot = NSTextField(labelWithString: "●")
     private let titleLabel = NSTextField(labelWithString: "")
     private let branchLabel = NSTextField(labelWithString: "")
@@ -367,6 +403,12 @@ final class SessionRow: NSView {
 
     deinit {
         spinnerTimer?.invalidate()
+    }
+
+    func setSelected(_ selected: Bool) {
+        guard selected != isSelected else { return }
+        isSelected = selected
+        updateAppearance()
     }
 
     private func applyLabel() {

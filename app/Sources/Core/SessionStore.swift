@@ -101,7 +101,7 @@ public final class SessionStore: ObservableObject {
     /// server, so the UI can show a splash + live log.
     /// - The branch is derived from the title (slug + short hex).
     /// - The title is stored as the session's displayName (local + server).
-    /// - The prompt is passed to codex when tmux first starts in the container.
+    /// - The prompt is passed to codex when abduco first starts in the container.
     @discardableResult
     public func spawn(title: String, prompt: String) -> SessionState {
         let trimmedTitle = title.trimmingCharacters(in: .whitespacesAndNewlines)

@@ -14,6 +14,9 @@ final class CenterHeaderView: NSView {
     var onSelectTab: ((String) -> Void)?
     var onCloseTab: ((String) -> Void)?
     var onShowSidePanel: (() -> Void)?
+    /// Fires on a double-click anywhere in the header's background (i.e. not
+    /// on a tab or button). The app toggles sidebar + side-panel collapse.
+    var onToggleFillWindow: (() -> Void)?
 
     private let tabStrip = NSStackView()
     private let tabClip = NSView()
@@ -135,6 +138,16 @@ final class CenterHeaderView: NSView {
     }
 
     @objc private func showTapped() { onShowSidePanel?() }
+
+    // Double-click on the header background (not on a tab or button) toggles
+    // the "fill window" layout. Single clicks here are ignored.
+    override func mouseDown(with event: NSEvent) {
+        if event.clickCount == 2 {
+            onToggleFillWindow?()
+            return
+        }
+        super.mouseDown(with: event)
+    }
 }
 
 private final class TabItemView: NSView {

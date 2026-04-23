@@ -16,6 +16,8 @@ final class TerminalTabView: NSView, TerminalViewDelegate {
     private var ptySession: PTYSession?
     private var moshSession: MoshSession?
     private let transport: Transport
+    private var scrollMonitor: Any?
+    private var scrollAccumulator: CGFloat = 0
 
     /// Create a terminal tab using mosh transport (recommended for interactive use).
     /// `args` is the argv of the remote command (first element is the program).
@@ -42,8 +44,13 @@ final class TerminalTabView: NSView, TerminalViewDelegate {
 
         terminalView.applyTheme(TerminalTheme.tokyoNight)
         terminalView.font = AppFont.regular(12)
-        // Disable mouse reporting so remote apps (tmux, claude, etc.) can't
-        // hijack mouse events — ensures click+drag selection and Cmd+C work.
+        // SwiftTerm defaults to 500 lines of scrollback; bump it so long codex
+        // conversations don't roll off the top during a session.
+        terminalView.changeScrollback(10_000)
+        // Disable mouse reporting so remote TUIs can't hijack mouse events —
+        // ensures click+drag selection and Cmd+C work. Scroll wheel falls
+        // through to SwiftTerm's native handler (scrolls the main-buffer
+        // scrollback); see the comment at the bottom of the file.
         terminalView.allowMouseReporting = false
         terminalView.translatesAutoresizingMaskIntoConstraints = false
         terminalView.terminalDelegate = self
@@ -55,6 +62,41 @@ final class TerminalTabView: NSView, TerminalViewDelegate {
             terminalView.trailingAnchor.constraint(equalTo: trailingAnchor),
             terminalView.bottomAnchor.constraint(equalTo: bottomAnchor),
         ])
+
+        // SwiftTerm 1.2.0's scrollWheel silently drops events when
+        // event.deltaY == 0 — the normal case for macOS trackpad precision
+        // scrolls (the real delta is in scrollingDeltaY). Intercept with a
+        // local event monitor so our handler runs before SwiftTerm's broken
+        // default consumes the event, and scroll the main-buffer scrollback.
+        scrollMonitor = NSEvent.addLocalMonitorForEvents(matching: .scrollWheel) { [weak self] event in
+            guard let self = self, let window = self.window,
+                  event.window === window else { return event }
+            let point = self.convert(event.locationInWindow, from: nil)
+            guard self.bounds.contains(point) else { return event }
+            self.handleScrollEvent(event)
+            return nil
+        }
+    }
+
+    deinit {
+        if let monitor = scrollMonitor {
+            NSEvent.removeMonitor(monitor)
+        }
+    }
+
+    private func handleScrollEvent(_ event: NSEvent) {
+        let raw = event.hasPreciseScrollingDeltas ? event.scrollingDeltaY : event.deltaY
+        guard raw != 0 else { return }
+        let linesDelta: CGFloat = event.hasPreciseScrollingDeltas ? raw / 16 : raw
+        scrollAccumulator += linesDelta
+        let whole = Int(scrollAccumulator.rounded(.towardZero))
+        guard whole != 0 else { return }
+        scrollAccumulator -= CGFloat(whole)
+        if whole > 0 {
+            terminalView.scrollUp(lines: whole)
+        } else {
+            terminalView.scrollDown(lines: -whole)
+        }
     }
 
     /// Open the session and start streaming.
@@ -106,6 +148,21 @@ final class TerminalTabView: NSView, TerminalViewDelegate {
         ptySession = nil
         moshSession?.close()
         moshSession = nil
+    }
+
+    /// Route first-responder status to the inner SwiftTerm view so keystrokes
+    /// land in the terminal after view-hierarchy swaps (tab switches, side
+    /// panel animations, panel dismissals).
+    func focusTerminal() {
+        window?.makeFirstResponder(terminalView)
+    }
+
+    override func viewDidMoveToWindow() {
+        super.viewDidMoveToWindow()
+        // Re-grab focus after being re-parented (switchMainTab removes/re-adds).
+        if window != nil {
+            DispatchQueue.main.async { [weak self] in self?.focusTerminal() }
+        }
     }
 
     /// Send raw bytes to the terminal session (used for forwarding key combos).
@@ -175,30 +232,7 @@ final class TerminalTabView: NSView, TerminalViewDelegate {
 
     func iTermContent(source: TerminalView, content: ArraySlice<UInt8>) {}
 
-    // MARK: - Scroll forwarding to tmux
-    // Since allowMouseReporting is false, SwiftTerm doesn't forward mouse events
-    // to the terminal. But we still need scroll wheel to reach tmux so it can
-    // scroll its scrollback (especially for alt-screen apps like Claude Code).
-    // We send raw SGR mouse wheel sequences directly via term.sendResponse.
-
-    override func scrollWheel(with event: NSEvent) {
-        guard event.deltaY != 0 else {
-            return super.scrollWheel(with: event)
-        }
-        let term = terminalView.getTerminal()
-        let cols = max(1, term.cols)
-        let rows = max(1, term.rows)
-        let point = terminalView.convert(event.locationInWindow, from: nil)
-        let cellW = terminalView.bounds.width / CGFloat(cols)
-        let cellH = terminalView.bounds.height / CGFloat(rows)
-        let col = max(1, min(cols, Int(point.x / cellW) + 1))
-        let row = max(1, min(rows, Int((terminalView.bounds.height - point.y) / cellH) + 1))
-
-        // SGR mouse encoding: button 64 = wheel up, 65 = wheel down
-        let button = event.deltaY > 0 ? 64 : 65
-        let count = max(1, min(5, Int(abs(event.deltaY))))
-        for _ in 0..<count {
-            term.sendResponse(text: "\u{1b}[<\(button);\(col);\(row)M")
-        }
-    }
+    // Scroll wheel is handled by ScrollableTerminalView (the inner view)
+    // because events hit the innermost view first and aren't forwarded when
+    // SwiftTerm's default scrollWheel bails on deltaY == 0.
 }

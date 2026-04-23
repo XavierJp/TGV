@@ -14,7 +14,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     zsh \
     neovim \
-    tmux \
     fzf \
     bat \
     fd-find \
@@ -26,6 +25,22 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     bubblewrap \
     && locale-gen en_US.UTF-8 \
     && rm -rf /var/lib/apt/lists/*
+
+# abduco: Ubuntu 24.04 dropped the package, so build from the upstream v0.6
+# tarball (single C file, near-instant compile). `make install PREFIX=/usr`
+# drops the binary at /usr/bin/abduco.
+#
+# The sed patch strips the two lines in client.c that emit `\e[?1049h` /
+# `\e[?1049l` — abduco-client unconditionally enters the terminal's alternate
+# screen on attach. That broke codex scrollback because alt-screen content
+# never lands in SwiftTerm's scrollback buffer. After the patch abduco is
+# fully pass-through and codex's inline rendering flows into scrollback.
+RUN curl -fsSL https://github.com/martanne/abduco/archive/refs/tags/v0.6.tar.gz -o /tmp/abduco.tar.gz \
+    && tar -xzf /tmp/abduco.tar.gz -C /tmp \
+    && sed -i '/1049[hl]/d' /tmp/abduco-0.6/client.c \
+    && make -C /tmp/abduco-0.6 \
+    && make -C /tmp/abduco-0.6 install PREFIX=/usr \
+    && rm -rf /tmp/abduco-0.6 /tmp/abduco.tar.gz
 
 # GitHub CLI
 RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
@@ -125,19 +140,6 @@ command -v batcat &>/dev/null && alias cat='batcat --paging=never'
 command -v fdfind &>/dev/null && alias fd='fdfind'
 [ -f ~/.fzf.zsh ] && source ~/.fzf.zsh
 ZSHEOF
-
-# tmux config — used by `tmux new-session -A -s tgv` from the TGV app
-# mouse on: tmux handles scroll wheel for scrollback. Selection/copy is
-# handled client-side by TGV (allowMouseReporting=false on TerminalView).
-RUN cat > /home/dev/.tmux.conf << 'TMUXEOF'
-set -g status off
-set -g mouse on
-set -g history-limit 50000
-set -g default-terminal "xterm-256color"
-set -ga terminal-overrides ",*256col*:Tc"
-set -g set-clipboard on
-bind-key -n C-q detach
-TMUXEOF
 
 # Neovim config with lazy.nvim + Tokyo Night + lualine (plugins downloaded at build time)
 RUN mkdir -p /home/dev/.config/nvim && cat > /home/dev/.config/nvim/init.lua << 'NVIMEOF'

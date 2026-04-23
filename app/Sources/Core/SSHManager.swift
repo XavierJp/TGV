@@ -117,6 +117,38 @@ public actor SSHManager {
         self.client = nil
     }
 
+    /// Upload `data` to `remotePath` via SFTP, creating/truncating the file and
+    /// setting its POSIX permissions (default 0600). Used for secret files so the
+    /// payload never appears in `ps aux` on the server — which it would with the
+    /// `echo <b64> | base64 -d > file` pattern.
+    public func writeFile(_ remotePath: String, data: Data, permissions: UInt32 = 0o600) async throws {
+        if client == nil {
+            try await connect()
+        }
+        guard let c = client else { throw SSHError.notConnected }
+
+        let attrs: SFTPFileAttributes = {
+            var a = SFTPFileAttributes()
+            a.permissions = permissions
+            return a
+        }()
+
+        do {
+            try await c.withSFTP { sftp in
+                try await sftp.withFile(
+                    filePath: remotePath,
+                    flags: [.write, .create, .truncate],
+                    attributes: attrs
+                ) { file in
+                    try await file.write(ByteBuffer(data: data))
+                }
+            }
+        } catch {
+            self.client = nil
+            throw error
+        }
+    }
+
     /// Open a PTY session that runs `command` (typically a docker exec attach).
     /// Returns a long-lived `PTYSession` for read/write/resize.
     @available(macOS 15.0, *)
