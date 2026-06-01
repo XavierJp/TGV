@@ -1,30 +1,29 @@
 # TGV development tasks
 
-# Build and run the macOS app (kills any running instance first)
+# Run the TUI
 run:
-    @pkill -f .build/debug/TGV 2>/dev/null || true
-    @sleep 0.5
-    @mkdir -p ~/.local/share/tgv && cp docker/Dockerfile ~/.local/share/tgv/Dockerfile
-    cd app && swift build 2>&1 | tail -5 && .build/debug/TGV &
+    @exec go run ./cmd/tgv
 
-# Build release binary
+# Build release binary into ~/.local/bin/tgv
 build:
-    cd app && swift build -c release 2>&1 | tail -5
+    go build -o ~/.local/bin/tgv ./cmd/tgv
 
-# Install everything (app + tgv-init + LaunchAgent)
+# Install everything (binary + tgv-init + Dockerfile)
 install:
     ./install.sh
+
+# Uninstall
+uninstall:
+    ./uninstall.sh
 
 # Init a remote server
 init *ARGS:
     ./bin/tgv-init {{ARGS}}
 
-# Kill running app
-kill:
-    @pkill -f .build/debug/TGV 2>/dev/null || true
-    @pkill -f .build/release/TGV 2>/dev/null || true
-    @echo "killed"
-
-# Clean build artifacts
+# Clean Go build cache for this module
 clean:
-    cd app && rm -rf .build .swiftpm
+    go clean ./...
+
+# Lint / vet
+vet:
+    go vet ./...

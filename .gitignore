@@ -9,3 +9,7 @@ build/
 
 /app/.build
 /app/.swiftpm
+
+# Go build output
+/tgv
+/cmd/tgv/tgv

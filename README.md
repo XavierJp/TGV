@@ -8,15 +8,15 @@ In the AI era, a reliable internet connection should be a given. In high-latency
 
 Enter TGV, a tool that spawns remote sessions on your workhorse server.
 
-TGV spins up isolated YOLO containers that run OpenCode with OpenRouter. They run on the remote server which keeps a stable connection even when you don't.
+TGV spins up isolated YOLO containers that run Codex with OpenRouter. They run on the remote server which keeps a stable connection even when you don't.
 
 ---
 
 ## What's in the box
 
-- **TGV.app** — native macOS app with embedded SwiftTerm. Sidebar of sessions, center pane runs `abduco + opencode`, side panel has Terminal / Files / Git tabs.
-- **tgv-init** — bash script that builds the docker image (with your repo baked in) and writes the config the app reads.
-- **docker/Dockerfile** — image with `abduco`, `nvim`, `zsh + oh-my-zsh`, `gh`, `node`, `pnpm`, `uv`, `opencode` all preinstalled.
+- **tgv** — a bubbletea TUI that lists sessions, shows per-session git status / PR state, creates sessions (title + prompt), and launches `ssh docker exec` attach / shell in a new tab of your current terminal.
+- **tgv-init** — bash script that builds the docker image (with your repo baked in) and writes the config the TUI reads.
+- **docker/Dockerfile** — image with `abduco`, `nvim`, `zsh + oh-my-zsh`, `gh`, `node`, `pnpm`, `uv`, `codex` all preinstalled.
 
 ## Installation
 
@@ -26,10 +26,10 @@ cd TGV
 ./install.sh
 ```
 
-This builds and installs:
+Requires Go 1.22+ locally (`brew install go`). Installs:
+- `tgv` to `~/.local/bin/tgv`
 - `tgv-init` to `~/.local/bin/tgv-init`
-- The Dockerfile to `~/.local/share/tgv/Dockerfile`
-- `TGV.app` to `~/.local/bin/TGV` (auto-starts on login via LaunchAgent)
+- `Dockerfile` to `~/.local/share/tgv/Dockerfile`
 
 ## Setup
 
@@ -51,18 +51,32 @@ tgv-init --host user@<server-ip> --repo https://github.com/org/repo --branch dev
 4. Create the docker network
 5. Save `~/.tgv/config.toml`
 
-Then launch the **TGV** app from your menu bar (or it'll already be running from the LaunchAgent).
+Then run `tgv`.
 
-## Using the app
+## Using the TUI
 
-- **Sidebar (left)** — list of sessions, `+ New Session` button, host metrics (CPU / GPU / RAM / Disk)
-- **Center** — `abduco` running `opencode` for the active session. `Ctrl+Q` to detach.
-- **Right panel** — three tabs:
-  - **Terminal** — raw `zsh` shell into the same container
-  - **Files** — `tree` view of the workspace
-  - **Git** — `watch git status` (auto-refreshes every 2s)
+```
+TGV  user@host                           ●  3 sessions · 2s ago
 
-Sessions persist across SSH disconnects via abduco, so you can close the app, reopen it, and pick up exactly where you left off.
+  ●  add dark mode (tgv/add-dark-ab12)           ↑2 ↓0  mod:3  +42 -8  PR #12 open
+  ●  fix login flow (tgv/fix-login-34c)          clean
+  ⟳  swift-river-3a8                             Starting container
+
+n new   a attach   s shell   x kill   ↑↓ move   q quit
+```
+
+| Key | Action |
+|---|---|
+| `n` | Create a new session (title + prompt) |
+| `a` | Attach codex in a new terminal tab (`abduco -A`) |
+| `s` | Open a plain shell in the container in a new terminal tab |
+| `x` | Kill and remove the selected session |
+| `↑`/`↓` or `k`/`j` | Move selection |
+| `q` or `Ctrl-C` | Quit |
+
+Attach / shell commands are launched in a **new tab of your current terminal** (Apple Terminal, iTerm2, WezTerm supported natively; Ghostty and others fall back to Terminal.app). Codex sessions survive the SSH disconnect via `abduco`, so you can close the tab and reattach any time.
+
+The TUI polls in the background — session list every 10s, git status every 5s, PR info every 60s. The UI never blocks on SSH.
 
 ## Uninstall
 
@@ -70,14 +84,12 @@ Sessions persist across SSH disconnects via abduco, so you can close the app, re
 ./uninstall.sh
 ```
 
-Removes binaries, LaunchAgent, and optionally `~/.tgv` config.
-
 ## Requirements
 
-**Local machine (macOS 14+)**
+**Local machine (macOS)**
 
-- Swift toolchain (for building the app)
-- SSH (pre-installed)
+- Go 1.22+ (`brew install go`)
+- SSH
 - [GitHub CLI](https://cli.github.com/) (for private repos)
 
 **Remote server (Ubuntu/Debian)**
@@ -110,30 +122,33 @@ default_branch = "main"
 [git]
 name = "Your Name"
 email = "you@example.com"
+
+[ui]
+# Where attach / shell open. Omit or "auto" to detect from $TERM_PROGRAM.
+# Recognized: "iterm", "terminal", "wezterm", "ghostty".
+terminal = "iterm"
 ```
 
 ## Architecture
 
 ```
-┌─────────────────────────────────────────────┐
-│  TGV.app (Swift + SwiftTerm + Citadel SSH)  │
-│  ┌──────┬─────────────┬─────────────┐       │
-│  │ Side │ Main        │ Side panel  │       │
-│  │ bar  │ (abduco +   │ Term/Files/ │       │
-│  │      │  opencode)  │ Git tabs    │       │
-│  └──────┴─────────────┴─────────────┘       │
-└─────────────────────────────────────────────┘
-                    │
-                    │  Single SSH connection (Citadel)
-                    │  Multiplexed PTY exec channels
-                    ▼
-┌─────────────────────────────────────────────┐
-│  Remote server                              │
-│  ┌─────────────┐  ┌─────────────┐           │
-│  │ container1  │  │ container2  │           │
-│  │abduco+opencode│ │abduco+opencode│        │
-│  └─────────────┘  └─────────────┘           │
-└─────────────────────────────────────────────┘
+┌────────────────────────────────────┐
+│ tgv (bubbletea TUI)                │
+│  Store ── polls via SSH every N s  │
+│    │                               │
+│    ▼                               │
+│  List │ New session form           │
+└────────────────────────────────────┘
+           │   attach / shell:
+           │   osascript → new tab → ssh -t host …
+           ▼
+┌────────────────────────────────────┐
+│ Remote server                      │
+│  ┌───────────┐   ┌───────────┐     │
+│  │container1 │   │container2 │     │
+│  │abduco+cx  │   │abduco+cx  │     │
+│  └───────────┘   └───────────┘     │
+└────────────────────────────────────┘
 ```
 
 ## License

@@ -147,6 +147,18 @@ check_remote() {
 check_remote "docker --version" "Docker"  "curl -fsSL https://get.docker.com | sh"
 check_remote "git --version"    "git"     "sudo apt install -y git"
 
+# Eternal Terminal — optional, needed only for connection = "et" in config.
+if ssh "$SSH_TARGET" "command -v etserver >/dev/null 2>&1"; then
+    if ssh "$SSH_TARGET" "pgrep -x etserver >/dev/null 2>&1"; then
+        echo "  ✓ etserver: installed and running"
+    else
+        echo "  ⚠ etserver: installed but not running — start with: sudo systemctl start etserver"
+    fi
+else
+    echo "  ⚠ etserver: not installed (optional — needed for connection = \"et\" in config)"
+    echo "    install: sudo apt install -y et  or  https://mistertea.github.io/EternalTerminal"
+fi
+
 # ─── Build Docker image ───────────────────────────────────────────────────────
 
 echo "Building Docker image with $REPO ($BRANCH)..."
@@ -222,7 +234,7 @@ echo "  ✓ Network ready: $DOCKER_NETWORK"
 mkdir -p "$HOME/.tgv"
 CONFIG="$HOME/.tgv/config.toml"
 
-cat > "$CONFIG" <<EOF
+NEW_CONFIG=$(cat <<EOF
 [server]
 host = "$HOSTNAME"
 user = "$USER_NAME"
@@ -238,9 +250,22 @@ default_branch = "$BRANCH"
 [git]
 name = "$GIT_NAME"
 email = "$GIT_EMAIL"
+
+# [ui]
+# terminal   = "auto"   # auto | cmux | iterm | wezterm | ghostty | terminal
+# connection = "ssh"    # ssh | et  (et = Eternal Terminal, preserves scrollback)
 EOF
-chmod 600 "$CONFIG"
-echo "  ✓ Config saved to $CONFIG"
+)
+
+if [[ -f "$CONFIG" ]]; then
+    printf '%s\n' "$NEW_CONFIG" > "$CONFIG.new"
+    chmod 600 "$CONFIG.new"
+    echo "  ✓ Config already exists — skipped (check $CONFIG.new for any new defaults)"
+else
+    printf '%s\n' "$NEW_CONFIG" > "$CONFIG"
+    chmod 600 "$CONFIG"
+    echo "  ✓ Config saved to $CONFIG"
+fi
 
 echo
 echo "Done. Launch the TGV app to manage sessions."

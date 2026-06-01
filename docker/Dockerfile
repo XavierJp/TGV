@@ -62,7 +62,7 @@ RUN curl -LsSf https://astral.sh/uv/install.sh | sh \
     && chmod 755 /usr/local/bin/uv
 
 # OpenAI Codex CLI
-RUN npm install -g @openai/codex
+RUN npm install -g @openai/codex@0.128.0
 
 # rtk (Rust Token Killer)
 RUN curl -fsSL https://raw.githubusercontent.com/rtk-ai/rtk/refs/heads/master/install.sh | sh \

@@ -3,23 +3,28 @@ set -e
 
 echo "Uninstalling TGV..."
 
-# Stop and remove LaunchAgent
+# Legacy LaunchAgent from the Swift app era — remove if present.
 PLIST="$HOME/Library/LaunchAgents/com.tgv.bar.plist"
 if [ -f "$PLIST" ]; then
   launchctl bootout "gui/$(id -u)/com.tgv.bar" 2>/dev/null || true
   rm -f "$PLIST"
-  echo "  Removed LaunchAgent"
+  echo "  Removed legacy LaunchAgent"
 fi
 
-# Kill running TGV
-pkill TGV 2>/dev/null && echo "  Stopped TGV" || true
+# Legacy Swift .app bundle.
+APP_BUNDLE="$HOME/Applications/TGV.app"
+if [ -d "$APP_BUNDLE" ]; then
+  rm -rf "$APP_BUNDLE"
+  echo "  Removed legacy $APP_BUNDLE"
+fi
 
-# Remove binaries + shared files
+# Binaries + shared files
 for f in \
+  "$HOME/.local/bin/tgv" \
   "$HOME/.local/bin/TGV" \
   "$HOME/.local/bin/tgv-init" \
   "$HOME/.local/share/tgv/Dockerfile"; do
-  if [ -f "$f" ]; then
+  if [ -e "$f" ] || [ -L "$f" ]; then
     rm -f "$f"
     echo "  Removed $f"
   fi
