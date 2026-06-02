@@ -1,26 +1,42 @@
 #!/bin/bash
 set -e
 
-echo "Uninstalling tgv..."
+echo "Uninstalling TGV..."
 
-# Stop and remove LaunchAgent
+# Legacy LaunchAgent from the Swift app era — remove if present.
 PLIST="$HOME/Library/LaunchAgents/com.tgv.bar.plist"
 if [ -f "$PLIST" ]; then
   launchctl bootout "gui/$(id -u)/com.tgv.bar" 2>/dev/null || true
   rm -f "$PLIST"
-  echo "  Removed LaunchAgent"
+  echo "  Removed legacy LaunchAgent"
 fi
 
-# Kill running TGVBar
-pkill TGVBar 2>/dev/null && echo "  Stopped TGVBar" || true
+# Legacy Swift .app bundle.
+APP_BUNDLE="$HOME/Applications/TGV.app"
+if [ -d "$APP_BUNDLE" ]; then
+  rm -rf "$APP_BUNDLE"
+  echo "  Removed legacy $APP_BUNDLE"
+fi
 
-# Remove binaries
-for bin in "$HOME/.cargo/bin/tgv" "$HOME/.local/bin/TGVBar"; do
-  if [ -f "$bin" ]; then
-    rm -f "$bin"
-    echo "  Removed $bin"
+# Binaries + shared files
+for f in \
+  "$HOME/.local/bin/tgv" \
+  "$HOME/.local/bin/TGV" \
+  "$HOME/.local/bin/tgv-init" \
+  "$HOME/.local/share/tgv/Dockerfile" \
+  "$HOME/.local/share/tgv/network-allowlist.sh"; do
+  if [ -e "$f" ] || [ -L "$f" ]; then
+    rm -f "$f"
+    echo "  Removed $f"
   fi
 done
+rmdir "$HOME/.local/share/tgv" 2>/dev/null || true
+
+# Legacy Rust install (if present)
+if [ -f "$HOME/.cargo/bin/tgv" ]; then
+  rm -f "$HOME/.cargo/bin/tgv"
+  echo "  Removed legacy ~/.cargo/bin/tgv"
+fi
 
 # Config
 if [ -d "$HOME/.tgv" ]; then

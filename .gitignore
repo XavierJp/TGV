@@ -7,9 +7,9 @@ dist/
 build/
 .eggs/
 
+/app/.build
+/app/.swiftpm
 
-# Added by cargo
-
-/target
-
-/menubar/.build
+# Go build output
+/tgv
+/cmd/tgv/tgv
