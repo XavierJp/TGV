@@ -184,9 +184,3 @@ func writeCmuxPaneState(workspace, pane string) error {
 	}
 	return os.WriteFile(p, []byte(pane), 0o600)
 }
-
-// Preformat renders a plain command line for copy-paste use when auto-launch
-// isn't wanted. Not currently called; kept for future "Copy command" action.
-func Preformat(args []string) string {
-	return strings.Join(args, " ")
-}

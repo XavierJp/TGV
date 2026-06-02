@@ -28,6 +28,10 @@ echo "  Installed tgv-init to $INSTALL_DIR/tgv-init"
 install -m 0644 "$SCRIPT_DIR/docker/Dockerfile" "$SHARE_DIR/Dockerfile"
 echo "  Installed Dockerfile to $SHARE_DIR/Dockerfile"
 
+# 4. network-allowlist.sh (tgv-init applies it to restrict container egress)
+install -m 0755 "$SCRIPT_DIR/docker/network-allowlist.sh" "$SHARE_DIR/network-allowlist.sh"
+echo "  Installed network-allowlist.sh to $SHARE_DIR/network-allowlist.sh"
+
 echo
 echo "Done."
 echo "Next: tgv-init --host user@ip --repo https://github.com/org/repo"

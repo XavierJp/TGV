@@ -3,8 +3,6 @@ package ui
 import (
 	"fmt"
 	"strings"
-
-	"github.com/charmbracelet/lipgloss"
 )
 
 // meterSegments is how many cells the bar uses. 10 looks balanced — each
@@ -79,17 +77,4 @@ func renderLatency(ms int64) string {
 		st = styleWarn
 	}
 	return st.Render(fmt.Sprintf("%dms", ms))
-}
-
-// padRight ensures a multi-line string's lines all have a fixed width — useful
-// to make a column align under a header. Stripped trailing newline.
-func padRight(s string, width int) string {
-	lines := strings.Split(s, "\n")
-	for i, l := range lines {
-		w := lipgloss.Width(l)
-		if w < width {
-			lines[i] = l + strings.Repeat(" ", width-w)
-		}
-	}
-	return strings.Join(lines, "\n")
 }

@@ -3,6 +3,7 @@ package sshx
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"os"
@@ -13,6 +14,7 @@ import (
 	"github.com/pkg/sftp"
 	"golang.org/x/crypto/ssh"
 	"golang.org/x/crypto/ssh/agent"
+	"golang.org/x/crypto/ssh/knownhosts"
 )
 
 type ExecResult struct {
@@ -97,10 +99,14 @@ func (m *Manager) dial(ctx context.Context) (*ssh.Client, error) {
 	if err != nil {
 		return nil, err
 	}
+	hostKey, err := hostKeyCallback()
+	if err != nil {
+		return nil, err
+	}
 	cfg := &ssh.ClientConfig{
 		User:            m.user,
 		Auth:            auth,
-		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
+		HostKeyCallback: hostKey,
 		Timeout:         30 * time.Second,
 	}
 	addr := fmt.Sprintf("%s:%d", m.host, m.port)
@@ -233,4 +239,64 @@ func loadAuth() ([]ssh.AuthMethod, error) {
 		return nil, fmt.Errorf("no usable SSH auth (no agent, no ~/.ssh keys)")
 	}
 	return methods, nil
+}
+
+// hostKeyCallback verifies the server's host key against ~/.ssh/known_hosts.
+// An unknown host is trusted on first use and recorded (like ssh's
+// StrictHostKeyChecking=accept-new); a *changed* key is rejected — that's the
+// MITM protection that replaced the old InsecureIgnoreHostKey. The known_hosts
+// file (and ~/.ssh) is created if missing so this works on a fresh machine.
+func hostKeyCallback() (ssh.HostKeyCallback, error) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return nil, err
+	}
+	sshDir := filepath.Join(home, ".ssh")
+	if err := os.MkdirAll(sshDir, 0o700); err != nil {
+		return nil, err
+	}
+	khPath := filepath.Join(sshDir, "known_hosts")
+	// Ensure the file exists — knownhosts.New errors on a missing path.
+	if f, err := os.OpenFile(khPath, os.O_CREATE|os.O_WRONLY, 0o600); err == nil {
+		_ = f.Close()
+	}
+	known, err := knownhosts.New(khPath)
+	if err != nil {
+		return nil, err
+	}
+	return func(hostname string, remote net.Addr, key ssh.PublicKey) error {
+		switch err := known(hostname, remote, key); {
+		case err == nil:
+			return nil // recognized and matches
+		case isUnknownHost(err):
+			return appendKnownHost(khPath, hostname, remote, key) // trust on first use
+		default:
+			return err // key mismatch (or other error) — refuse to connect
+		}
+	}, nil
+}
+
+// isUnknownHost reports whether err means "host absent from known_hosts" (safe
+// to trust on first use). A *knownhosts.KeyError with a populated Want means
+// the recorded key differs from what the server presented — never auto-trust
+// that, it's the MITM signal.
+func isUnknownHost(err error) bool {
+	var keyErr *knownhosts.KeyError
+	return errors.As(err, &keyErr) && len(keyErr.Want) == 0
+}
+
+func appendKnownHost(path, hostname string, remote net.Addr, key ssh.PublicKey) error {
+	addrs := []string{knownhosts.Normalize(hostname)}
+	if remote != nil {
+		if r := knownhosts.Normalize(remote.String()); r != addrs[0] {
+			addrs = append(addrs, r)
+		}
+	}
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY|os.O_CREATE, 0o600)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	_, err = f.WriteString(knownhosts.Line(addrs, key) + "\n")
+	return err
 }

@@ -23,7 +23,8 @@ for f in \
   "$HOME/.local/bin/tgv" \
   "$HOME/.local/bin/TGV" \
   "$HOME/.local/bin/tgv-init" \
-  "$HOME/.local/share/tgv/Dockerfile"; do
+  "$HOME/.local/share/tgv/Dockerfile" \
+  "$HOME/.local/share/tgv/network-allowlist.sh"; do
   if [ -e "$f" ] || [ -L "$f" ]; then
     rm -f "$f"
     echo "  Removed $f"

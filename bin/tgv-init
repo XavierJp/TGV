@@ -13,9 +13,17 @@ BRANCH="main"
 PRIVATE=0
 HOST=""
 REPO=""
+GITHUB_HANDLE=""
+NO_ALLOWLIST=0
 
 DOCKER_IMAGE="tgv-session:latest"
 DOCKER_NETWORK="tgv-net"
+
+# Domains the session containers are allowed to reach. Everything else is
+# dropped by an iptables egress allowlist applied on the server. Override with
+# --allow "a.com b.com" or the TGV_ALLOW_DOMAINS env var.
+ALLOW_DOMAINS_DEFAULT="github.com api.github.com codeload.github.com objects.githubusercontent.com raw.githubusercontent.com openrouter.ai api.openai.com registry.npmjs.org pypi.org files.pythonhosted.org"
+ALLOW_DOMAINS="${TGV_ALLOW_DOMAINS:-$ALLOW_DOMAINS_DEFAULT}"
 
 # Resolve location of the docker/Dockerfile. Search order:
 #   1. $TGV_DOCKERFILE env var (explicit override)
@@ -39,16 +47,23 @@ done
 
 usage() {
     cat <<EOF
-Usage: tgv-init --host user@ip --repo <url> [--branch <name>] [--private]
+Usage: tgv-init --host user@ip --repo <url> [options]
 
 Options:
-  --host       SSH target (e.g. xavier@10.0.0.1)
-  --repo       Git repository URL (https:// or git@)
-  --branch     Default branch (default: main)
-  --private    Use 'gh auth token' to clone private repo
+  --host          SSH target (e.g. xavier@10.0.0.1)
+  --repo          Git repository URL (https:// or git@)
+  --branch        Default branch (default: main)
+  --private       Use 'gh auth token' to clone private repo
+  --github        GitHub handle — import its public keys into the server's
+                  authorized_keys (hardens who can SSH in)
+  --allow         Space/comma-separated egress allowlist domains
+                  (default: github + openrouter + npm/pypi)
+  --no-allowlist  Skip the iptables egress restriction (containers get full
+                  network access)
 
 Environment:
-  TGV_DOCKERFILE  Override path to docker/Dockerfile
+  TGV_DOCKERFILE     Override path to docker/Dockerfile
+  TGV_ALLOW_DOMAINS  Default egress allowlist (same as --allow)
 
 EOF
     exit 1
@@ -56,11 +71,14 @@ EOF
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --host)    HOST="$2"; shift 2 ;;
-        --repo)    REPO="$2"; shift 2 ;;
-        --branch)  BRANCH="$2"; shift 2 ;;
-        --private) PRIVATE=1; shift ;;
-        -h|--help) usage ;;
+        --host)         HOST="$2"; shift 2 ;;
+        --repo)         REPO="$2"; shift 2 ;;
+        --branch)       BRANCH="$2"; shift 2 ;;
+        --private)      PRIVATE=1; shift ;;
+        --github)       GITHUB_HANDLE="$2"; shift 2 ;;
+        --allow)        ALLOW_DOMAINS="$2"; shift 2 ;;
+        --no-allowlist) NO_ALLOWLIST=1; shift ;;
+        -h|--help)      usage ;;
         *) echo "Unknown argument: $1" >&2; usage ;;
     esac
 done
@@ -77,6 +95,9 @@ if [[ -z "$DOCKERFILE" ]]; then
     exit 1
 fi
 
+# network-allowlist.sh lives next to the Dockerfile (repo or install dir).
+ALLOWLIST_SCRIPT="$(dirname "$DOCKERFILE")/network-allowlist.sh"
+
 # ─── Parse host into user@hostname ────────────────────────────────────────────
 
 if [[ "$HOST" == *"@"* ]]; then
@@ -90,18 +111,30 @@ SSH_TARGET="$USER_NAME@$HOSTNAME"
 
 # ─── Validate inputs ──────────────────────────────────────────────────────────
 
-if [[ ! "$REPO" =~ ^https:// ]] && [[ ! "$REPO" =~ ^git@ ]]; then
-    echo "✕ Repo URL must start with https:// or git@" >&2
-    exit 1
-fi
-
-if [[ "$REPO" =~ [\;\|\&\`\$\(\)\{\}\<\>] ]]; then
-    echo "✕ Repo URL contains invalid characters" >&2
+# Positive allowlist: a scheme prefix followed by URL-safe characters only.
+# Rejects whitespace, quotes, backslashes and shell metacharacters, so $REPO is
+# safe to interpolate into the remote commands below.
+if [[ ! "$REPO" =~ ^(https://|git@)[A-Za-z0-9._:/@~+-]+$ ]]; then
+    echo "✕ Repo URL must be https:// or git@ with no spaces or shell metacharacters" >&2
     exit 1
 fi
 
 if [[ ! "$BRANCH" =~ ^[A-Za-z0-9._/-]+$ ]]; then
     echo "✕ Invalid branch name: $BRANCH" >&2
+    exit 1
+fi
+
+if [[ -n "$GITHUB_HANDLE" && ! "$GITHUB_HANDLE" =~ ^[A-Za-z0-9-]{1,39}$ ]]; then
+    echo "✕ Invalid GitHub handle: $GITHUB_HANDLE" >&2
+    exit 1
+fi
+
+# Normalize commas → spaces and validate the egress allowlist (domain chars,
+# wildcards and whitespace only) before it is interpolated into the remote
+# allowlist invocation.
+ALLOW_DOMAINS="${ALLOW_DOMAINS//,/ }"
+if [[ $NO_ALLOWLIST -eq 0 && ( -z "$ALLOW_DOMAINS" || ! "$ALLOW_DOMAINS" =~ ^[A-Za-z0-9._*[:space:]-]+$ ) ]]; then
+    echo "✕ --allow must be a space/comma-separated list of domains" >&2
     exit 1
 fi
 
@@ -130,6 +163,34 @@ if ! ssh -o ConnectTimeout=10 -o BatchMode=yes "$SSH_TARGET" "echo ok" >/dev/nul
     exit 1
 fi
 echo "  ✓ SSH OK"
+
+# ─── Import GitHub public keys into authorized_keys (optional) ──────────────────
+
+if [[ -n "$GITHUB_HANDLE" ]]; then
+    echo "Importing SSH keys from github.com/$GITHUB_HANDLE..."
+    GH_KEYS="$(curl -fsSL "https://github.com/$GITHUB_HANDLE.keys" || true)"
+    if [[ -z "$GH_KEYS" ]] || ! grep -qE '^(ssh-|ecdsa-|sk-)' <<<"$GH_KEYS"; then
+        echo "  ✗ No public keys found for github.com/$GITHUB_HANDLE" >&2
+        exit 1
+    fi
+    # Append on the server, skipping keys already present. Keys arrive on stdin
+    # so they never touch the remote argv; the remote script is single-quoted so
+    # nothing expands locally.
+    printf '%s\n' "$GH_KEYS" | ssh "$SSH_TARGET" '
+        umask 077
+        mkdir -p ~/.ssh && chmod 700 ~/.ssh
+        touch ~/.ssh/authorized_keys && chmod 600 ~/.ssh/authorized_keys
+        added=0
+        while IFS= read -r k; do
+            [ -z "$k" ] && continue
+            if ! grep -qxF "$k" ~/.ssh/authorized_keys; then
+                printf "%s\n" "$k" >> ~/.ssh/authorized_keys
+                added=$((added + 1))
+            fi
+        done
+        echo "  ✓ authorized_keys updated ($added new key(s))"
+    '
+fi
 
 # ─── Check remote deps ────────────────────────────────────────────────────────
 
@@ -183,11 +244,11 @@ if [[ $PRIVATE -eq 1 ]]; then
     REPO_PATH="${REPO#https://github.com/}"
     ssh "$SSH_TARGET" "printf '#!/bin/sh\ncat /tmp/tgv-build/.git-token' > /tmp/tgv-build/.git-askpass && chmod 700 /tmp/tgv-build/.git-askpass"
     printf '%s' "$GH_TOKEN" | ssh "$SSH_TARGET" "cat > /tmp/tgv-build/.git-token && chmod 600 /tmp/tgv-build/.git-token"
-    ssh "$SSH_TARGET" "GIT_ASKPASS=/tmp/tgv-build/.git-askpass git clone --branch $BRANCH https://x-access-token@github.com/$REPO_PATH /tmp/tgv-build/repo"
+    ssh "$SSH_TARGET" "GIT_ASKPASS=/tmp/tgv-build/.git-askpass git clone --branch '$BRANCH' 'https://x-access-token@github.com/$REPO_PATH' /tmp/tgv-build/repo"
     ssh "$SSH_TARGET" "rm -f /tmp/tgv-build/.git-askpass /tmp/tgv-build/.git-token"
-    ssh "$SSH_TARGET" "cd /tmp/tgv-build/repo && git remote set-url origin $REPO"
+    ssh "$SSH_TARGET" "cd /tmp/tgv-build/repo && git remote set-url origin '$REPO'"
 else
-    if ! ssh "$SSH_TARGET" "git clone --branch $BRANCH $REPO /tmp/tgv-build/repo"; then
+    if ! ssh "$SSH_TARGET" "git clone --branch '$BRANCH' '$REPO' /tmp/tgv-build/repo"; then
         echo "✕ git clone failed" >&2
         exit 1
     fi
@@ -229,15 +290,44 @@ if ! ssh "$SSH_TARGET" "docker network inspect $DOCKER_NETWORK >/dev/null 2>&1";
 fi
 echo "  ✓ Network ready: $DOCKER_NETWORK"
 
+# ─── Restrict container egress (iptables allowlist) ─────────────────────────────
+
+if [[ $NO_ALLOWLIST -eq 1 ]]; then
+    echo "  ⚠ Egress allowlist skipped (--no-allowlist) — containers have full network access"
+elif [[ ! -f "$ALLOWLIST_SCRIPT" ]]; then
+    echo "  ⚠ network-allowlist.sh not found ($ALLOWLIST_SCRIPT) — skipping egress restriction" >&2
+else
+    echo "Restricting egress to: $ALLOW_DOMAINS"
+    scp -q "$ALLOWLIST_SCRIPT" "$SSH_TARGET:/tmp/tgv-net-allowlist.sh"
+    # iptables needs root. $DOCKER_NETWORK is single-quoted (literal on the
+    # remote); $ALLOW_DOMAINS is left unquoted so it splits into per-domain args.
+    # NOTE: these rules are best-effort and do not survive a reboot or a Docker
+    # daemon restart — re-run tgv-init to reapply them.
+    if ssh "$SSH_TARGET" "sudo bash /tmp/tgv-net-allowlist.sh '$DOCKER_NETWORK' $ALLOW_DOMAINS"; then
+        echo "  ✓ Egress restricted for $DOCKER_NETWORK"
+    else
+        echo "  ✗ Failed to apply egress allowlist (needs passwordless sudo + iptables)" >&2
+        echo "    Fix sudo/iptables on the server, or pass --no-allowlist to skip." >&2
+        ssh "$SSH_TARGET" "rm -f /tmp/tgv-net-allowlist.sh" || true
+        exit 1
+    fi
+    ssh "$SSH_TARGET" "rm -f /tmp/tgv-net-allowlist.sh" || true
+fi
+
 # ─── Save config ──────────────────────────────────────────────────────────────
 
 mkdir -p "$HOME/.tgv"
 CONFIG="$HOME/.tgv/config.toml"
 
+GITHUB_LINE=""
+if [[ -n "$GITHUB_HANDLE" ]]; then
+    GITHUB_LINE=$'\n'"github = \"$GITHUB_HANDLE\""
+fi
+
 NEW_CONFIG=$(cat <<EOF
 [server]
 host = "$HOSTNAME"
-user = "$USER_NAME"
+user = "$USER_NAME"$GITHUB_LINE
 
 [docker]
 image = "$DOCKER_IMAGE"

@@ -42,16 +42,25 @@ tgv-init --host user@<server-ip> --repo https://github.com/org/repo --private
 
 # Custom branch
 tgv-init --host user@<server-ip> --repo https://github.com/org/repo --branch develop
+
+# Harden server access: import your GitHub public keys into authorized_keys
+tgv-init --host user@<server-ip> --repo https://github.com/org/repo --github your-handle
 ```
 
 `tgv-init` will:
 1. Check local + remote dependencies
-2. Prompt for your OpenRouter API key
+2. (with `--github <handle>`) import your GitHub public keys into the server's `authorized_keys`
 3. Clone the repo on the server, build the docker image with deps installed
-4. Create the docker network
+4. Create the docker network and **restrict container egress to an allowlist** (see Security)
 5. Save `~/.tgv/config.toml`
 
 Then run `tgv`.
+
+### Security
+
+- **Host keys** — `tgv` verifies the server's SSH host key against `~/.ssh/known_hosts` (trust-on-first-use, then rejects on change). No more blind connections.
+- **Server access** — `--github <handle>` pulls `https://github.com/<handle>.keys` into the server's `authorized_keys`, so only keys on your GitHub account can log in.
+- **Container egress** — by default `tgv-init` applies an iptables allowlist to the docker network: containers may only reach a fixed set of domains (GitHub, OpenRouter, npm, PyPI). Override with `--allow "a.com b.com"` / `TGV_ALLOW_DOMAINS`, or skip with `--no-allowlist`. Requires passwordless `sudo` + `iptables` on the server, and the rules are reapplied on each `tgv-init` run (they don't survive a reboot).
 
 ## Using the TUI
 
@@ -97,6 +106,7 @@ The TUI polls in the background — session list every 10s, git status every 5s,
 - [Docker](https://get.docker.com)
 - git
 - An SSH key you can authenticate with from your Mac
+- `iptables` + passwordless `sudo` (for the container egress allowlist; pass `--no-allowlist` to skip)
 
 **API**
 
@@ -110,6 +120,7 @@ Stored at `~/.tgv/config.toml`:
 [server]
 host = "10.0.0.1"
 user = "deploy"
+# github = "your-handle"   # recorded by `tgv-init --github`; keys synced to authorized_keys
 
 [docker]
 image = "tgv-session:latest"
